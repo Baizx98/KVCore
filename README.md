@@ -28,6 +28,7 @@ Current design direction:
 - block-aware KV metadata
 - explicit pre/post attention hook points
 - research-friendly, easy-to-refactor code structure
+- selective borrowing from recent vLLM KV/offload design, especially canonical KV views and transport abstraction
 
 Current implementation constraint:
 

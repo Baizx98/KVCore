@@ -17,6 +17,9 @@ The roadmap should follow these principles:
 - reference path before optimized path
 - explicit KV abstractions before advanced policies
 - stable tests before performance claims
+- use first-stage implementations to preserve clean evolution toward layer-wise control and block-oriented offload
+- learn from recent vLLM offload design where useful, especially transport abstraction, canonical KV views, pinned CPU pools, and explicit transfer granularity
+- do not copy vLLM's connector stack too early; keep KVCore aligned with its own layer-context and hook-driven execution model
 
 When implementation reality changes, update this file.
 
@@ -29,12 +32,15 @@ Goal:
 - establish a minimal Python package layout
 - define config and request state skeletons
 - create a minimal engine entry path
+- load a Hugging Face Llama checkpoint through reusable model-adapter code
+- run a minimal single-request greedy decode smoke path
 
 Exit criteria:
 
 - package imports work
 - engine can be constructed
-- a minimal decode smoke path exists
+- Llama tokenizer/model loading works through KVCore entry points
+- a minimal greedy decode smoke path exists
 
 ---
 
@@ -43,14 +49,17 @@ Exit criteria:
 Goal:
 
 - define block-level KV metadata
+- define canonical KV references that hide model-family-specific layout details
 - introduce per-layer KV state
 - build a basic allocator and sequence-to-block mapping
+- keep metadata separate from the actual `transformers` `past_key_values` storage used in the initial reference path
 
 Exit criteria:
 
 - block allocation and release are testable
 - per-layer KV ownership is explicit
 - request-specific KV views have a clear skeleton
+- canonical KV references are explicit enough to support future offload and selection work without redesign
 
 ---
 
@@ -107,12 +116,17 @@ Goal:
 - add hierarchical KV residency
 - support controlled CPU/GPU block movement
 - integrate offload with the layer-wise control path
+- use a transport abstraction that separates policy, orchestration, and directional transfer handlers
+- use reusable pinned CPU pools rather than per-transfer temporary buffers
+- allow CPU and GPU block granularities to differ when beneficial
 
 Exit criteria:
 
 - residency state is explicit
 - offload and reload preserve correctness
 - bookkeeping is testable under repeated movement
+- transfer APIs are block-spec-driven rather than tensor-slice-driven
+- request-, layer-, and block-granular movement paths are representable, with block-granular control as the target path
 
 ---
 

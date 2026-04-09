@@ -20,6 +20,13 @@ The architecture should make the following explicit:
 - separation of metadata and data
 - hook points around attention
 - room for hierarchical KV residency and selective KV use
+- transport and residency control as first-class subsystems rather than attention-side details
+
+Reference direction:
+
+- learn from recent vLLM design evolution for KV cache management and native KV offload
+- especially borrow the clean separation between logical KV metadata, transport orchestration, and concrete transfer handlers
+- do not copy vLLM's full connector architecture mechanically; adapt the ideas to KVCore's layer-wise runtime
 
 ---
 
@@ -92,6 +99,7 @@ Responsibilities:
 
 - block allocation
 - layer-wise KV state tracking
+- canonical KV view construction across model families
 - request-specific KV view construction
 - residency tracking
 - prefix reuse
@@ -101,6 +109,12 @@ Responsibilities:
 
 This is the architectural center of the repository.
 
+Design notes:
+
+- model-family-specific KV layout should be normalized before the KV subsystem consumes it
+- offload, prefix reuse, selection, and pruning should operate on canonical block-oriented metadata rather than arbitrary model-internal tensor references
+- CPU and GPU block granularities may differ and this mismatch should be represented explicitly rather than hidden
+
 ### 3.6 Hook subsystem
 
 Responsibilities:
@@ -109,6 +123,15 @@ Responsibilities:
 - post-attention hook execution
 - metadata updates around attention
 - integration points for prefetch, offload, pruning, and scoring
+
+Expected long-term flow:
+
+1. layer executor builds `LayerContext`
+2. pre-attention hooks prepare selected views and launch prefetch when needed
+3. attention consumes the selected KV view
+4. post-attention hooks update scores, residency, and eviction candidates
+
+KVCore should prefer this layer-context-driven integration over a large external connector abstraction.
 
 ### 3.7 Kernel/backend layer
 
@@ -146,11 +169,18 @@ The exact class names may change, but the design should preserve these concepts:
 - `BatchContext`
 - `LayerContext`
 - `KVBlock`
+- `CanonicalKVTensor`
+- `CanonicalKVRef`
+- `CanonicalLayerKVState`
 - `LayerKVState`
 - `RequestKVView`
 - `BlockAllocator`
 - `PrefixCache`
 - `OffloadCoordinator`
+- `TransferWorker`
+- `TransferSpec`
+- `CpuToGpuTransferHandler`
+- `GpuToCpuTransferHandler`
 - `SelectionPolicy`
 - `PrunePolicy`
 - `HookManager`
@@ -162,6 +192,13 @@ Important semantic distinctions:
 - `selected`: participates in the current attention computation
 
 These concepts should not be merged casually.
+
+Important offload distinctions:
+
+- canonical KV metadata is not the same thing as backend-specific tensor storage
+- transport policy is not the same thing as transport execution
+- CPU->GPU and GPU->CPU transfers should not be treated as identical operations
+- request-granular, layer-granular, and block-granular movement are distinct capabilities and should not be collapsed into one path
 
 ---
 

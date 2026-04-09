@@ -85,6 +85,18 @@ When writing or changing code:
 - prefer clarity, testability, and observability over premature optimization
 - keep changes atomic and easy to review
 
+Additional design guidance:
+
+- borrow core ideas from recent vLLM architecture evolution, especially native KV offload design
+- treat data transfer as an independent abstraction rather than embedding transport details in attention logic
+- prefer block-id-driven transfer specs over direct tensor-slice-oriented transfer APIs
+- canonicalize model-family-specific KV layout into a shared KV view before offload, pruning, or selection logic consumes it
+- model CPU->GPU and GPU->CPU movement as separate directional handlers rather than one generic move primitive
+- design future offload around reusable pinned-memory CPU pools rather than temporary per-transfer buffers
+- do not assume CPU and GPU block sizes must be identical; granularity differences should be modeled explicitly
+- keep offload coordination aligned with layer execution and hook contexts rather than forcing a large connector framework too early
+- avoid request-granular-only offload design; the long-term target should support request-, layer-, and block-granular movement, with block-granular control as the main path
+
 If the current structure blocks clean implementation, refactoring is allowed.
 
 ---
