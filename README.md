@@ -24,6 +24,8 @@ KVCore treats KV cache as a first-class runtime-managed object rather than a sid
 
 Current design direction:
 
+- top-level coordination through `LLMEngine`
+- explicit `Scheduler`, `ModelRunner`, and `KVManager` boundaries
 - layer-by-layer execution
 - block-aware KV metadata
 - explicit pre/post attention hook points
@@ -44,6 +46,12 @@ Current implementation constraint:
 - Mistral3
 
 Only decoder-only inference is in scope.
+
+Current execution direction:
+
+- prefill and decode are handled separately
+- scheduler output should evolve toward flattened token-oriented batch metadata
+- chunked prefill is intentionally deferred until the core engine, scheduler, and KV boundaries stabilize
 
 ---
 

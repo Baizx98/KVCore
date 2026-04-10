@@ -9,24 +9,25 @@ If implementation reveals a better structure, this document should be updated.
 
 ## 1. Architectural intent
 
-KVCore is designed around one central assumption:
+KVCore is a research-oriented LLM inference framework centered on one assumption:
 
-> KV cache is a first-class runtime object.
+> KV cache is a first-class runtime object managed by the engine.
 
-The architecture should make the following explicit:
+The current design target is:
 
-- layer-by-layer execution
-- block-aware KV management
-- separation of metadata and data
-- hook points around attention
-- room for hierarchical KV residency and selective KV use
-- transport and residency control as first-class subsystems rather than attention-side details
+- a thin API layer
+- one top-level `LLMEngine` that coordinates the system
+- a minimal scheduler that manages request progression
+- a `ModelRunner` that hides model-family details and executes the model
+- a `KVManager` that owns KV cache metadata and physical block resources
+- explicit layer-wise execution boundaries
+- batch representations that can scale toward flattened token scheduling
 
 Reference direction:
 
-- learn from recent vLLM design evolution for KV cache management and native KV offload
-- especially borrow the clean separation between logical KV metadata, transport orchestration, and concrete transfer handlers
-- do not copy vLLM's full connector architecture mechanically; adapt the ideas to KVCore's layer-wise runtime
+- learn from recent vLLM design evolution where it helps, especially block pools, token-flattened batching, KV cache manager layering, and offload abstractions
+- do not copy vLLM's entire connector or serving stack mechanically
+- keep KVCore aligned with its own layer-wise and research-friendly control flow
 
 ---
 
@@ -34,17 +35,22 @@ Reference direction:
 
 Target execution flow:
 
-1. scheduler accepts and tracks requests
-2. scheduler produces a batch plan
-3. engine builds batch context
-4. model execution proceeds layer by layer
-5. pre-attention hooks update or prepare KV state
-6. attention runs against block-aware KV views
-7. post-attention hooks update residency, scores, or next-step metadata
-8. logits are produced
-9. scheduler commits results and updates request states
+1. API receives one or more generation requests
+2. API forwards requests to `LLMEngine`
+3. `LLMEngine` inserts requests into the scheduler
+4. scheduler selects either a prefill batch or a decode batch
+5. `KVManager` prepares block metadata and physical block assignments
+6. `ModelRunner` converts the scheduled batch into model input metadata
+7. model execution proceeds layer by layer
+8. `LLMEngine` consumes outputs, updates request states, and releases finished KV blocks
+9. API returns completed results
 
-The system should avoid collapsing this into a single opaque whole-model forward when doing so would hide KV lifecycle control.
+Current simplifications:
+
+- prefill and decode are separate execution modes
+- chunked prefill is not implemented yet
+- offload is not implemented yet
+- only decoder-only inference is in scope
 
 ---
 
@@ -54,136 +60,170 @@ The system should avoid collapsing this into a single opaque whole-model forward
 
 Responsibilities:
 
-- configuration objects
+- user-facing request and response objects
 - engine construction
-- model loading entry points
-- user-facing generation interface
+- generation entry points
+- returning final inference results
 
 This layer should stay thin.
 
-### 3.2 Scheduler
+### 3.2 LLMEngine
 
 Responsibilities:
 
-- request lifecycle
-- prefill/decode progression
-- continuous batching
-- chunked prefill planning
-- finish conditions
+- act as the top-level coordinator
+- own `Scheduler`, `KVManager`, and `ModelRunner`
+- accept requests from the API
+- drive engine steps until requests finish
+- update request lifecycle state
+- return final outputs to the API layer
 
-The scheduler decides **what runs next**, not how KV is stored internally.
+`LLMEngine` should orchestrate, not own model-family logic or low-level KV policy details.
 
-### 3.3 Runtime
-
-Responsibilities:
-
-- execute one step
-- construct batch and layer contexts
-- iterate through layers
-- coordinate scheduler, model runtime, hooks, and KV subsystem
-- later host CUDA-graph-safe decode execution if needed
-
-This is the control plane of the system.
-
-### 3.4 Model runtime
+### 3.3 Scheduler
 
 Responsibilities:
 
-- adapt Qwen3 / Llama3 / Mistral3 into a unified execution interface
-- hide model-family-specific naming and layout details
-- expose layer-level execution boundaries needed by the runtime
+- maintain `waiting` and `running` queues
+- decide which requests move into execution
+- produce either a prefill batch or a decode batch
+- expose batch metadata in a form the runner can consume
+
+Current design constraints:
+
+- only `waiting` and `running` queues are maintained
+- no chunked prefill
+- no preemption
+- no offload-aware scheduling yet
+
+Batch design direction:
+
+- scheduler output should move toward flattened token-oriented batch metadata
+- request-level bookkeeping remains explicit even if execution is token-flattened
+
+### 3.4 ModelRunner
+
+Responsibilities:
+
+- hide model-family-specific details
+- load model, tokenizer, and relevant configs
+- initialize KV cache bottom-level buffers
+- perform profile runs
+- transform scheduled batches into model-executable metadata
+- execute prefill or decode
+- move model outputs back into engine-owned state objects
+
+Current model focus:
+
+- Llama first
+- Qwen and Mistral later
+
+`ModelRunner` is the execution center for model-specific behavior.
 
 ### 3.5 KV subsystem
 
+Top-level owner:
+
+- `KVManager`
+
 Responsibilities:
 
-- block allocation
-- layer-wise KV state tracking
-- canonical KV view construction across model families
-- request-specific KV view construction
-- residency tracking
-- prefix reuse
-- selection
-- pruning
-- offload coordination
+- own KV cache lifecycle
+- manage request-to-block mappings
+- expose per-layer KV views
+- provide attention metadata derived from block mappings
+- coordinate physical block allocation through a block pool
+- later integrate offload
 
-This is the architectural center of the repository.
+Suggested internal structure:
+
+- `KVManager`
+- `SingleTypeKVManager`
+- `BlockPool`
+- `RequestBlockTable`
+- `LayerKVState`
+- `RequestKVView`
+- later `OffloadManager`
 
 Design notes:
 
-- model-family-specific KV layout should be normalized before the KV subsystem consumes it
-- offload, prefix reuse, selection, and pruning should operate on canonical block-oriented metadata rather than arbitrary model-internal tensor references
-- CPU and GPU block granularities may differ and this mismatch should be represented explicitly rather than hidden
+- `KVManager` is the architectural center of the repository
+- per-layer state should remain explicit
+- object boundaries should not assume one manager object per layer forever
+- model-family-specific layout should be canonicalized before KV policy logic consumes it
 
-### 3.6 Hook subsystem
+### 3.6 BlockPool
 
-Responsibilities:
+`BlockPool` should follow the same high-level philosophy as vLLM:
+
+- blocks are pre-created and reused
+- physical blocks are managed through a free structure rather than ad hoc allocation
+- block identity is stable and reusable
+- future prefix reuse and eviction should be able to build on the same block pool
+
+Current role:
+
+- manage physical block ownership
+- allocate and free blocks
+- support request lifecycle transitions
+
+Future role:
+
+- support cached blocks
+- support prefix hits
+- support offload-aware residency
+
+### 3.7 Hook subsystem
+
+Long-term responsibilities:
 
 - pre-attention hook execution
 - post-attention hook execution
-- metadata updates around attention
-- integration points for prefetch, offload, pruning, and scoring
+- prefetch, offload, pruning, and score-update integration
 
-Expected long-term flow:
+Current design rule:
 
-1. layer executor builds `LayerContext`
-2. pre-attention hooks prepare selected views and launch prefetch when needed
-3. attention consumes the selected KV view
-4. post-attention hooks update scores, residency, and eviction candidates
+- main execution control should stay in the runner and engine
+- hooks are extension points around explicit layer boundaries, not the primary control mechanism
 
-KVCore should prefer this layer-context-driven integration over a large external connector abstraction.
-
-### 3.7 Kernel/backend layer
+### 3.8 Kernel/backend layer
 
 Responsibilities:
 
 - reference attention path
-- paged attention path
-- selective attention path
-- memory movement helpers when needed
+- future paged attention path
+- future selective attention path
+- later memory-movement helpers
 
 Recommended progression:
 
 - reference implementation first
 - optimized backend later
 
-### 3.8 Metrics and benchmarks
-
-Responsibilities:
-
-- latency measurement
-- throughput measurement
-- memory accounting
-- offload traffic accounting
-- correctness and policy evaluation
-
 ---
 
-## 4. Key data abstractions
+## 4. Key runtime objects
 
 The exact class names may change, but the design should preserve these concepts:
 
-- `Request`
-- `SequenceState`
-- `BatchPlan`
+- `GenerateRequest`
+- `GenerateResult`
+- `RequestState`
+- `LLMEngine`
+- `Scheduler`
+- `ScheduledBatch`
 - `BatchContext`
 - `LayerContext`
+- `ModelRunner`
+- `ModelAdapter`
+- `KVManager`
+- `SingleTypeKVManager`
+- `BlockPool`
 - `KVBlock`
-- `CanonicalKVTensor`
-- `CanonicalKVRef`
-- `CanonicalLayerKVState`
 - `LayerKVState`
 - `RequestKVView`
-- `BlockAllocator`
-- `PrefixCache`
-- `OffloadCoordinator`
-- `TransferWorker`
-- `TransferSpec`
-- `CpuToGpuTransferHandler`
-- `GpuToCpuTransferHandler`
-- `SelectionPolicy`
-- `PrunePolicy`
-- `HookManager`
+- `AttentionMetadata`
+- later `OffloadManager`
 
 Important semantic distinctions:
 
@@ -193,56 +233,120 @@ Important semantic distinctions:
 
 These concepts should not be merged casually.
 
-Important offload distinctions:
+---
 
-- canonical KV metadata is not the same thing as backend-specific tensor storage
-- transport policy is not the same thing as transport execution
-- CPU->GPU and GPU->CPU transfers should not be treated as identical operations
-- request-granular, layer-granular, and block-granular movement are distinct capabilities and should not be collapsed into one path
+## 5. Batch and attention metadata
+
+Batch design direction should follow these rules:
+
+- scheduler outputs should be compatible with flattened token-oriented execution
+- request-level bookkeeping remains explicit even if tokens are flattened
+- prefill and decode remain separate execution modes for now
+
+Suggested `ScheduledBatch` fields:
+
+- `mode`
+- `request_ids`
+- `num_requests`
+- `num_tokens`
+- `flat_input_ids`
+- `flat_position_ids`
+- `request_offsets`
+- `request_token_counts`
+
+Suggested `AttentionMetadata` fields:
+
+- `mode`
+- `layer_id`
+- `num_requests`
+- `num_tokens`
+- `request_offsets`
+- `request_token_counts`
+- `slot_mapping`
+- `block_tables`
+- `context_lens`
+- `query_start_locs`
+- `seq_lens`
+- `max_seq_len`
+- `max_query_len`
+- `kv_cache_dtype`
+
+Current simplification:
+
+- the physical KV layout may be continuous and sufficiently large
+- metadata should still be designed as if future paged/block execution will consume it
 
 ---
 
-## 5. Directory scaffold target
+## 6. KV layout progression
+
+Near-term design:
+
+- continuous KV cache buffers
+- enough capacity for current requests
+- explicit layer-wise state
+- explicit block metadata even when physical storage is contiguous
+
+This gives a clean transition path:
+
+1. continuous physical buffers
+2. explicit block metadata and request block tables
+3. paged/block attention backends
+4. offload, selection, and pruning on top of the same metadata
+
+The important rule is:
+
+- physical simplicity is acceptable early
+- interface simplicity that blocks later research is not
+
+---
+
+## 7. Directory scaffold target
 
 The repository should gradually converge toward a structure similar to:
 
 ```text
 kvcore/
   api/
+  engine/
   scheduler/
-  runtime/
+  model_runner/
   model/
   kv/
+  runtime/
   hooks/
   kernels/
   metrics/
   benchmark/
 tests/
 docs/
+example/
 ```
 
 Suggested responsibilities:
 
 - `kvcore/api/`
-  - public construction and configuration interfaces
+  - public request, response, config, and construction interfaces
+- `kvcore/engine/`
+  - `LLMEngine` and top-level coordination logic
 - `kvcore/scheduler/`
-  - request state and batching logic
-- `kvcore/runtime/`
-  - step execution and layer orchestration
+  - request queues and batch planning
+- `kvcore/model_runner/`
+  - model execution entry points, metadata construction, and buffer initialization
 - `kvcore/model/`
   - model-family adapters
 - `kvcore/kv/`
-  - block metadata, allocation, views, offload, prefix reuse
+  - block pool, block metadata, request views, and future offload
+- `kvcore/runtime/`
+  - execution contexts and shared runtime data objects
 - `kvcore/hooks/`
-  - hook interfaces and implementations
+  - optional pre/post layer lifecycle extensions
 - `kvcore/kernels/`
   - reference and optimized attention backends
 - `kvcore/metrics/`
   - runtime metrics and measurement utilities
 - `kvcore/benchmark/`
   - benchmark harnesses and experiment entry points
-- `tests/`
-  - unit, integration, and end-to-end tests
 
 This scaffold is a target, not a frozen contract.
 If implementation needs a cleaner arrangement, update this document accordingly.

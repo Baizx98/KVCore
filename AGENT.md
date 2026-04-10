@@ -88,6 +88,11 @@ When writing or changing code:
 Additional design guidance:
 
 - borrow core ideas from recent vLLM architecture evolution, especially native KV offload design
+- use `LLMEngine` as the top-level coordinator over API, scheduler, model runner, and KV management
+- keep `ModelRunner` responsible for model loading, buffer initialization, profile runs, and model-executable metadata construction
+- keep `KVManager` as the top-level KV owner, with `BlockPool` managing physical blocks
+- move scheduler outputs toward flattened token-oriented batch metadata where practical
+- keep prefill and decode as separate execution modes until chunked prefill is intentionally implemented
 - treat data transfer as an independent abstraction rather than embedding transport details in attention logic
 - prefer block-id-driven transfer specs over direct tensor-slice-oriented transfer APIs
 - canonicalize model-family-specific KV layout into a shared KV view before offload, pruning, or selection logic consumes it

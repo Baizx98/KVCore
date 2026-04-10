@@ -20,6 +20,8 @@ The roadmap should follow these principles:
 - use first-stage implementations to preserve clean evolution toward layer-wise control and block-oriented offload
 - learn from recent vLLM offload design where useful, especially transport abstraction, canonical KV views, pinned CPU pools, and explicit transfer granularity
 - do not copy vLLM's connector stack too early; keep KVCore aligned with its own layer-context and hook-driven execution model
+- keep `LLMEngine` as the top-level coordinator over scheduler, model runner, and KV manager
+- move toward flattened token-oriented batch metadata, while keeping prefill and decode separate until chunked prefill is intentionally introduced
 
 When implementation reality changes, update this file.
 
@@ -67,14 +69,18 @@ Exit criteria:
 
 Goal:
 
-- convert execution into an explicit layer-by-layer runtime
-- introduce batch and layer contexts
-- make the control path KV-aware
+- introduce a top-level `LLMEngine` / `Scheduler` / `ModelRunner` / `KVManager` split
+- convert execution into an explicit layer-by-layer runner path
+- introduce batch and layer contexts plus complete attention metadata
+- make the control path KV-aware under a continuous-KV assumption
 
 Exit criteria:
 
+- `LLMEngine` is the top-level coordinator
+- scheduler exposes explicit prefill or decode batches
+- `ModelRunner` can execute prefill and decode separately
 - runtime iterates through layers explicitly
-- attention no longer depends on opaque past-key-values style flow
+- attention no longer depends on opaque past-key-values style flow at the engine boundary
 - reference execution path is stable enough for comparison tests
 
 ---
@@ -86,12 +92,14 @@ Goal:
 - add request progression logic
 - support continuous batching
 - support chunked prefill without bypassing KV abstractions
+- move scheduler batch outputs toward flattened token-oriented metadata
 
 Exit criteria:
 
 - request state transitions are explicit
 - mixed prefill/decode scheduling is testable
 - chunk progression preserves correct KV state
+- flattened batch metadata remains consistent with request-level bookkeeping
 
 ---
 
