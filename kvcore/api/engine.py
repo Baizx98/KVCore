@@ -2,44 +2,35 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from kvcore.api.config import EngineConfig, GenerationConfig
 from kvcore.api.types import GenerationResult, Request
-from kvcore.kv import BlockAllocator
-from kvcore.logging import setup_logging
-from kvcore.model import LlamaModelAdapter
-from kvcore.runtime import GreedyGenerationRuntime
+from kvcore.engine import LLMEngine
 
 
 @dataclass(slots=True)
 class Engine:
-    """Minimal engine for the first implementation stage."""
+    """User-facing wrapper around the top-level LLMEngine."""
 
     config: EngineConfig
-    adapter: Any
-    allocator: BlockAllocator = field(default_factory=BlockAllocator)
+    llm_engine: LLMEngine
 
     @classmethod
     def from_pretrained(cls, config: EngineConfig | None = None) -> Engine:
-        resolved_config = config or EngineConfig()
-        setup_logging(resolved_config.log_level)
-        adapter = LlamaModelAdapter.from_config(resolved_config)
-        return cls(config=resolved_config, adapter=adapter)
+        llm_engine = LLMEngine.from_pretrained(config)
+        return cls(config=llm_engine.config, llm_engine=llm_engine)
+
+    @property
+    def adapter(self):
+        return self.llm_engine.adapter
 
     def generate(
         self,
         request: Request,
         generation_config: GenerationConfig | None = None,
     ) -> GenerationResult:
-        runtime = GreedyGenerationRuntime(
-            adapter=self.adapter,
-            engine_config=self.config,
-            allocator=self.allocator,
-        )
-        resolved_generation_config = generation_config or GenerationConfig()
-        return runtime.generate(
+        return self.llm_engine.generate(
             request=request,
-            generation_config=resolved_generation_config,
+            generation_config=generation_config,
         )

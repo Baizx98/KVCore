@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from kvcore.api import Engine, EngineConfig, GenerationConfig, Request
+from kvcore.api.types import GenerationResult
+from kvcore.engine import LLMEngine
+from kvcore.kv import KVManager
+from kvcore.model_runner import ModelRunner
+from kvcore.scheduler import Scheduler
 
 
 class FakeTokenizer:
@@ -31,13 +36,14 @@ class FakeAdapter:
 
     def prepare_layer_inputs(
         self,
+        *,
         input_ids: FakeTensor,
         attention_mask: FakeTensor | None,
         past_key_values: FakeCache | None,
     ) -> FakePreparedInputs:
         cache = past_key_values or self.init_cache()
         q_len = len(input_ids.tolist())
-        prepared = FakePreparedInputs(
+        return FakePreparedInputs(
             hidden_states=FakeTensor([[0]]),
             causal_mask=attention_mask,
             position_ids=FakeTensor([[0]]),
@@ -46,7 +52,6 @@ class FakeAdapter:
             past_seq_len=cache.get_seq_length(),
             q_len=q_len,
         )
-        return prepared
 
     def iter_layers(self) -> tuple[FakeLayer, ...]:
         return (FakeLayer(), FakeLayer())
@@ -54,14 +59,15 @@ class FakeAdapter:
     def run_layer(
         self,
         *,
-        layer_module: "FakeLayer",
+        layer_module: FakeLayer,
         hidden_states: FakeTensor,
         attention_mask: FakeTensor | None,
         position_ids: FakeTensor,
         position_embeddings: tuple[str, str],
-        past_key_values: "FakeCache",
+        past_key_values: FakeCache,
     ) -> FakeTensor:
         layer_module.forward()
+        past_key_values.seq_len = max(past_key_values.seq_len, position_ids.item() + 1)
         return hidden_states
 
     def finalize_hidden_states(self, hidden_states: FakeTensor) -> FakeTensor:
@@ -75,6 +81,9 @@ class FakeAdapter:
     def decode_tokens(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def make_input_ids(self, token_ids: list[int], *, device: str) -> FakeTensor:
+        return FakeTensor([token_ids])
+
 
 class FakeLayer:
     def forward(self) -> None:
@@ -83,11 +92,11 @@ class FakeLayer:
 
 @dataclass
 class FakePreparedInputs:
-    hidden_states: "FakeTensor"
-    causal_mask: "FakeTensor | None"
-    position_ids: "FakeTensor"
+    hidden_states: FakeTensor
+    causal_mask: FakeTensor | None
+    position_ids: FakeTensor
     position_embeddings: tuple[str, str]
-    past_key_values: "FakeCache"
+    past_key_values: FakeCache
     past_seq_len: int
     q_len: int
 
@@ -111,21 +120,18 @@ class FakeTensor:
     def __getitem__(self, item):
         if isinstance(self.data, int):
             return self
-        data = self.data
         if isinstance(item, tuple):
             return self
-        return FakeTensor(data[item])
+        return FakeTensor(self.data[item])
 
     def argmax(self, dim: int = -1) -> FakeTensor:
         return FakeTensor(self.data)
 
     def item(self) -> int:
-        if isinstance(self.data, list):
-            value = self.data
-            while isinstance(value, list):
-                value = value[0]
-            return int(value)
-        return int(self.data)
+        value = self.data
+        while isinstance(value, list):
+            value = value[0]
+        return int(value)
 
     def tolist(self):
         if isinstance(self.data, list) and self.data and isinstance(self.data[0], list):
@@ -133,31 +139,60 @@ class FakeTensor:
         return self.data
 
 
-class FakeTorchModule:
-    class _NoGrad:
-        def __enter__(self):
-            return None
+@dataclass
+class FakeLLMEngine:
+    config: EngineConfig
+    adapter: FakeAdapter
+    result: GenerationResult
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    @staticmethod
-    def no_grad():
-        return FakeTorchModule._NoGrad()
-
-    @staticmethod
-    def tensor(data, device: str = "cpu") -> FakeTensor:
-        return FakeTensor(data)
+    def generate(
+        self,
+        request: Request,
+        generation_config: GenerationConfig | None = None,
+    ) -> GenerationResult:
+        return self.result
 
 
-def test_engine_generate_uses_greedy_runtime(monkeypatch) -> None:
-    monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorchModule)
-
-    engine = Engine(
-        config=EngineConfig(max_new_tokens=4, block_size=2),
-        adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+def test_engine_delegates_to_llm_engine() -> None:
+    expected = GenerationResult(
+        text="ok",
+        token_ids=[1, 2],
+        generated_token_ids=[2],
+        finish_reason="length",
+        num_prompt_tokens=1,
+        num_generated_tokens=1,
+        request_id="req-test",
+        kv_block_count=2,
+        kv_total_tokens=2,
     )
-    result = engine.generate(
+    engine = Engine(
+        config=EngineConfig(),
+        llm_engine=FakeLLMEngine(
+            config=EngineConfig(),
+            adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+            result=expected,
+        ),
+    )
+
+    result = engine.generate(Request(prompt="hello", request_id="req-test"))
+
+    assert result is expected
+
+
+def test_llm_engine_generate_uses_scheduler_kv_manager_and_model_runner() -> None:
+    kv_manager = KVManager.from_model_config(num_layers=2, block_size=2, device="cpu")
+    llm_engine = LLMEngine(
+        config=EngineConfig(max_new_tokens=4, block_size=2),
+        model_runner=ModelRunner(
+            adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+            block_size=2,
+            kv_manager=kv_manager,
+        ),
+        kv_manager=kv_manager,
+        scheduler=Scheduler(),
+    )
+
+    result = llm_engine.generate(
         request=Request(prompt="hello", request_id="req-test"),
         generation_config=GenerationConfig(eos_token_id=3),
     )

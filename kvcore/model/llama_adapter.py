@@ -112,6 +112,11 @@ class LlamaModelAdapter:
     def decode_tokens(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def make_input_ids(self, token_ids: list[int], *, device: str) -> Any:
+        import torch
+
+        return torch.tensor([token_ids], device=device)
+
     def init_cache(self) -> Any:
         from transformers.cache_utils import DynamicCache
 
