@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 from kvcore.api import Engine, EngineConfig, GenerationConfig, Request
 from kvcore.api.types import GenerationResult
@@ -31,7 +32,7 @@ class FakeAdapter:
             "attention_mask": FakeTensor([[1, 1, 1]]),
         }
 
-    def init_cache(self) -> object:
+    def init_cache(self) -> FakeCache:
         return FakeCache()
 
     def prepare_layer_inputs(
@@ -65,10 +66,20 @@ class FakeAdapter:
         position_ids: FakeTensor,
         position_embeddings: tuple[str, str],
         past_key_values: FakeCache,
+        attention_params=None,
     ) -> FakeTensor:
+        assert attention_params is not None
+        assert attention_params.layer_id in {0, 1}
+        assert attention_params.block_table.manager_block_ids
         layer_module.forward()
         past_key_values.seq_len = max(past_key_values.seq_len, position_ids.item() + 1)
         return hidden_states
+
+    def before_attention(self, *, layer_module: FakeLayer, layer_context) -> None:
+        layer_module.attention_params = layer_context.attention_params
+
+    def after_attention(self, *, layer_module: FakeLayer, layer_context) -> None:
+        layer_module.attention_params = None
 
     def finalize_hidden_states(self, hidden_states: FakeTensor) -> FakeTensor:
         return hidden_states
@@ -86,6 +97,8 @@ class FakeAdapter:
 
 
 class FakeLayer:
+    attention_params = None
+
     def forward(self) -> None:
         return None
 
@@ -167,10 +180,13 @@ def test_engine_delegates_to_llm_engine() -> None:
     )
     engine = Engine(
         config=EngineConfig(),
-        llm_engine=FakeLLMEngine(
-            config=EngineConfig(),
-            adapter=FakeAdapter(tokenizer=FakeTokenizer()),
-            result=expected,
+        llm_engine=cast(
+            LLMEngine,
+            FakeLLMEngine(
+                config=EngineConfig(),
+                adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+                result=expected,
+            ),
         ),
     )
 
@@ -202,3 +218,4 @@ def test_llm_engine_generate_uses_scheduler_kv_manager_and_model_runner() -> Non
     assert result.num_generated_tokens >= 1
     assert result.finish_reason in {"eos", "length"}
     assert result.kv_total_tokens == result.num_prompt_tokens + result.num_generated_tokens
+    assert len(kv_manager.layer_managers) == 2

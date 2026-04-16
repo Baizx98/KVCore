@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from kvcore.kv import RequestKVView
+from kvcore.kv import BlockTable, RequestKVView
 from kvcore.logging import get_logger
 from kvcore.runtime.context import (
     AttentionParams,
@@ -116,15 +116,20 @@ class SingleRequestModelRunner:
                 attention_params=attn_params,
             )
             self.before_layer(layer_context)
-            hidden_states = self.adapter.run_layer(
-                layer_module=layer_module,
-                hidden_states=hidden_states,
-                attention_mask=prepared_inputs.causal_mask,
-                position_ids=prepared_inputs.position_ids,
-                position_embeddings=prepared_inputs.position_embeddings,
-                past_key_values=cache,
-            )
-            self.after_layer(layer_context)
+            self.adapter.before_attention(layer_module=layer_module, layer_context=layer_context)
+            try:
+                hidden_states = self.adapter.run_layer(
+                    layer_module=layer_module,
+                    hidden_states=hidden_states,
+                    attention_mask=prepared_inputs.causal_mask,
+                    position_ids=prepared_inputs.position_ids,
+                    position_embeddings=prepared_inputs.position_embeddings,
+                    past_key_values=cache,
+                    attention_params=attn_params,
+                )
+            finally:
+                self.adapter.after_attention(layer_module=layer_module, layer_context=layer_context)
+                self.after_layer(layer_context)
             layer_contexts.append(layer_context)
 
         hidden_states = self.adapter.finalize_hidden_states(hidden_states)
@@ -165,6 +170,11 @@ class SingleRequestModelRunner:
         seq_block_starts = [block.token_start for block in layer_state.blocks]
         selected_block_ids = list(seq_block_ids)
         canonical_ref = sequence_state.kv_view.canonical_layer_states[layer_id].ref
+        block_table = BlockTable(
+            manager_block_size=self.block_size,
+            kernel_block_size=self.block_size,
+            manager_block_ids=seq_block_ids,
+        )
         return AttentionParams(
             layer_id=layer_id,
             hidden_states=hidden_states,
@@ -182,4 +192,6 @@ class SingleRequestModelRunner:
             seq_block_ids=seq_block_ids,
             seq_block_starts=seq_block_starts,
             selected_block_ids=selected_block_ids,
+            block_table=block_table,
+            kernel_block_ids=block_table.map_to_kernel_blocks(),
         )

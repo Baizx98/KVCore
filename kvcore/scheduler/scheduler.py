@@ -83,19 +83,27 @@ class Scheduler:
         if not request_state.finished:
             return None
 
+        sequence_state = request_state.sequence_state
+        if sequence_state is None:
+            raise RuntimeError(f"request_id={request_state.request_id!r} has no sequence state")
+        token_ids = request_state.prompt_token_ids + request_state.generated_token_ids
+        kv_manager.cache_request_blocks(
+            request_id=request_state.request_id,
+            token_ids=token_ids,
+        )
         result = GenerationResult(
             text=model_runner.adapter.decode_tokens(
                 request_state.generated_token_ids,
                 skip_special_tokens=generation_config.skip_special_tokens,
             ),
-            token_ids=request_state.prompt_token_ids + request_state.generated_token_ids,
+            token_ids=token_ids,
             generated_token_ids=list(request_state.generated_token_ids),
             finish_reason=request_state.finish_reason or "length",
             num_prompt_tokens=len(request_state.prompt_token_ids),
             num_generated_tokens=len(request_state.generated_token_ids),
             request_id=request_state.request_id,
-            kv_block_count=request_state.sequence_state.kv_view.total_block_count,
-            kv_total_tokens=request_state.sequence_state.kv_view.total_tokens,
+            kv_block_count=sequence_state.kv_view.total_block_count,
+            kv_total_tokens=sequence_state.kv_view.total_tokens,
             metadata={
                 "model_type": model_runner.adapter.model_type,
                 "device": model_runner.adapter.device,

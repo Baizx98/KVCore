@@ -20,6 +20,8 @@ The roadmap should follow these principles:
 - use first-stage implementations to preserve clean evolution toward layer-wise control and block-oriented offload
 - learn from recent vLLM offload design where useful, especially transport abstraction, canonical KV views, pinned CPU pools, and explicit transfer granularity
 - do not copy vLLM's connector stack too early; keep KVCore aligned with its own layer-context and hook-driven execution model
+- do not introduce a `KVCacheCoordinator` in the near-term architecture; `KVManager` directly owns
+  one `SingleTypeKVManager` per layer
 - keep `LLMEngine` as the top-level coordinator over scheduler, model runner, and KV manager
 - move toward flattened token-oriented batch metadata, while keeping prefill and decode separate until chunked prefill is intentionally introduced
 
@@ -73,6 +75,7 @@ Goal:
 - convert execution into an explicit layer-by-layer runner path
 - introduce batch and layer contexts plus complete attention metadata
 - make the control path KV-aware under a continuous-KV assumption
+- inject KVCore block metadata into Llama attention through explicit pre/post attention hooks
 
 Exit criteria:
 
@@ -81,7 +84,17 @@ Exit criteria:
 - `ModelRunner` can execute prefill and decode separately
 - runtime iterates through layers explicitly
 - attention no longer depends on opaque past-key-values style flow at the engine boundary
+- each Llama attention layer can observe its current `AttentionParams`, block table, and selected
+  KV block ids
 - reference execution path is stable enough for comparison tests
+
+Current implementation target:
+
+- `KVManager` directly aggregates per-layer `SingleTypeKVManager` instances.
+- `BlockPool` tracks reusable `KVCacheBlock` metadata, a free queue, null block, ref counts, and
+  cached block hashes.
+- `BlockTable` maps KV-manager block ids to kernel block ids, even while the reference path still
+  executes through Hugging Face attention.
 
 ---
 
@@ -109,11 +122,13 @@ Goal:
 
 - support block-level contiguous prefix reuse
 - integrate prefix hits into scheduler/runtime behavior
+- keep prefix hashing inside the KV manager path rather than as an external optimization
 
 Exit criteria:
 
 - exact and partial prefix-hit behavior is testable
 - model/config mismatches do not create false reuse
+- request release keeps cached hash metadata usable without requiring physical block deduplication
 
 ---
 

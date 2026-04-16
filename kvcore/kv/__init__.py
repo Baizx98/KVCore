@@ -1,7 +1,14 @@
 """KV metadata primitives."""
 
 from kvcore.kv.allocator import BlockAllocator
-from kvcore.kv.block_pool import BlockPool, PhysicalBlock
+from kvcore.kv.block_pool import (
+    BlockPool,
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+    PhysicalBlock,
+    hash_block_tokens,
+)
+from kvcore.kv.block_table import BlockTable, MultiGroupBlockTable
 from kvcore.kv.manager import KVManager
 from kvcore.kv.metadata import (
     CanonicalKVRef,
@@ -15,14 +22,19 @@ from kvcore.kv.single_type_manager import SingleTypeKVManager
 
 __all__ = [
     "BlockAllocator",
+    "BlockTable",
     "BlockPool",
     "CanonicalKVRef",
     "CanonicalKVTensor",
     "CanonicalLayerKVState",
+    "FreeKVCacheBlockQueue",
+    "KVCacheBlock",
     "KVManager",
     "KVBlock",
     "LayerKVState",
+    "MultiGroupBlockTable",
     "PhysicalBlock",
     "RequestKVView",
     "SingleTypeKVManager",
+    "hash_block_tokens",
 ]

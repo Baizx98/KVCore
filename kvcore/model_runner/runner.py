@@ -69,7 +69,9 @@ class ModelRunner:
             request_id=request_state.request_id,
             total_tokens=request_state.total_tokens + 1,
         )
-        request_state.sequence_state.kv_view = self.kv_manager.get_request_view(request_state.request_id)
+        request_state.sequence_state.kv_view = self.kv_manager.get_request_view(
+            request_state.request_id
+        )
         return self.layer_runner.run_decode_step(
             input_ids=next_input_ids,
             past_key_values=request_state.past_key_values,

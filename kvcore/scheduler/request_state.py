@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from kvcore.api.types import Request
 
@@ -17,7 +18,7 @@ class RequestState:
     generated_token_ids: list[int] = field(default_factory=list)
     encoded_inputs: dict[str, object] | None = None
     past_key_values: object | None = None
-    sequence_state: object | None = None
+    sequence_state: Any | None = None
     finished: bool = False
     finish_reason: str | None = None
 

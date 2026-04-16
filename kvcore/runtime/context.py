@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from kvcore.kv import LayerKVState, RequestKVView
+from kvcore.kv import BlockTable, LayerKVState, RequestKVView
 
 
 @dataclass(slots=True)
@@ -14,8 +14,8 @@ class SequenceState:
 
     request_id: str
     prompt_token_ids: list[int]
+    kv_view: RequestKVView
     generated_token_ids: list[int] = field(default_factory=list)
-    kv_view: RequestKVView | None = None
 
 
 @dataclass(slots=True)
@@ -38,6 +38,8 @@ class AttentionParams:
     seq_block_ids: list[int]
     seq_block_starts: list[int]
     selected_block_ids: list[int]
+    block_table: BlockTable
+    kernel_block_ids: list[int]
 
 
 @dataclass(slots=True)

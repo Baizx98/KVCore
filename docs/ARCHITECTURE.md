@@ -51,6 +51,8 @@ Current simplifications:
 - chunked prefill is not implemented yet
 - offload is not implemented yet
 - only decoder-only inference is in scope
+- KVCore intentionally skips a vLLM-style `KVCacheCoordinator` for now; each layer owns one
+  `SingleTypeKVManager`, and the top-level `KVManager` coordinates those managers directly
 
 ---
 
@@ -140,6 +142,7 @@ Suggested internal structure:
 - `KVManager`
 - `SingleTypeKVManager`
 - `BlockPool`
+- `BlockTable`
 - `RequestBlockTable`
 - `LayerKVState`
 - `RequestKVView`
@@ -149,8 +152,19 @@ Design notes:
 
 - `KVManager` is the architectural center of the repository
 - per-layer state should remain explicit
-- object boundaries should not assume one manager object per layer forever
+- the current simplified target is one `SingleTypeKVManager` per layer
+- `KVManager` is the direct owner of all layer managers; there is no coordinator layer in KVCore
 - model-family-specific layout should be canonicalized before KV policy logic consumes it
+
+The near-term KV stack is intentionally narrower than vLLM:
+
+1. `KVManager` is the request-facing logical control plane.
+2. `SingleTypeKVManager` owns the block table for exactly one attention layer.
+3. `BlockPool` owns physical block metadata, free ordering, and prefix-cache hash metadata.
+4. `BlockTable` maps KV-manager block ids to kernel-consumable block ids at execution time.
+
+This keeps the code small while preserving the control points needed for prefix caching,
+layer-aware policies, offload, and future paged attention kernels.
 
 ### 3.6 BlockPool
 
@@ -166,6 +180,7 @@ Current role:
 - manage physical block ownership
 - allocate and free blocks
 - support request lifecycle transitions
+- retain cached block hash metadata without forcing physical block deduplication
 
 Future role:
 
@@ -185,6 +200,8 @@ Current design rule:
 
 - main execution control should stay in the runner and engine
 - hooks are extension points around explicit layer boundaries, not the primary control mechanism
+- Llama-family adapters expose KVCore attention metadata by installing per-layer hook state on
+  the Hugging Face `self_attn` module before attention executes and removing it immediately after
 
 ### 3.8 Kernel/backend layer
 
@@ -275,6 +292,8 @@ Current simplification:
 
 - the physical KV layout may be continuous and sufficiently large
 - metadata should still be designed as if future paged/block execution will consume it
+- the reference Llama path still uses Hugging Face cache storage for numerical correctness, while
+  KVCore passes explicit block metadata to attention hooks for future kernel replacement
 
 ---
 

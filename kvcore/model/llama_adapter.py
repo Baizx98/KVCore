@@ -69,7 +69,7 @@ class LlamaModelAdapter:
             dtype=torch_dtype,
         )
         model.eval()
-        model.to(device)
+        model.to(device)  # type: ignore[arg-type]
 
         logger.info(
             "loaded llama model_type=%s layers=%s device=%s dtype=%s",
@@ -170,6 +170,7 @@ class LlamaModelAdapter:
         position_ids: Any,
         position_embeddings: Any,
         past_key_values: Any,
+        attention_params: Any | None = None,
     ) -> Any:
         return layer_module(
             hidden_states,
@@ -178,7 +179,27 @@ class LlamaModelAdapter:
             past_key_values=past_key_values,
             use_cache=True,
             position_embeddings=position_embeddings,
+            kvcore_attention_params=attention_params,
         )
+
+    def before_attention(self, *, layer_module: Any, layer_context: Any) -> None:
+        """Expose KVCore attention metadata to the HF Llama attention module."""
+
+        attention_module = getattr(layer_module, "self_attn", None)
+        if attention_module is None:
+            return
+        attention_module.kvcore_attention_params = layer_context.attention_params
+        attention_module.kvcore_block_table = layer_context.attention_params.block_table
+
+    def after_attention(self, *, layer_module: Any, layer_context: Any) -> None:
+        """Remove per-step KVCore hook state after one layer finishes."""
+
+        attention_module = getattr(layer_module, "self_attn", None)
+        if attention_module is None:
+            return
+        for attr_name in ("kvcore_attention_params", "kvcore_block_table"):
+            if hasattr(attention_module, attr_name):
+                delattr(attention_module, attr_name)
 
     def finalize_hidden_states(self, hidden_states: Any) -> Any:
         return self.model.model.norm(hidden_states)

@@ -36,6 +36,7 @@ class KVBlock:
     capacity: int
     residency: str = "gpu"
     alive: bool = True
+    block_hash: str | None = None
 
 
 @dataclass(slots=True)
