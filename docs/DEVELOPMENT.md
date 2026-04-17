@@ -86,9 +86,9 @@ Examples:
 ```text
 feat: add minimal layer-wise engine skeleton
 fix: correct kv block release on request finish
-refactor: split scheduler state from batch planning
+refactor: merge scheduler request and batch state
 doc: rewrite architecture and implementation docs
-test: add allocator lifecycle unit tests
+test: add block pool lifecycle unit tests
 chore: add pre-commit and mypy configuration
 perf: reduce kv view rebuild overhead in decode path
 style: normalize import ordering in runtime package

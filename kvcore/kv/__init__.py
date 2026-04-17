@@ -1,6 +1,5 @@
 """KV metadata primitives."""
 
-from kvcore.kv.allocator import BlockAllocator
 from kvcore.kv.block_pool import (
     BlockPool,
     FreeKVCacheBlockQueue,
@@ -21,7 +20,6 @@ from kvcore.kv.metadata import (
 from kvcore.kv.single_type_manager import SingleTypeKVManager
 
 __all__ = [
-    "BlockAllocator",
     "BlockTable",
     "BlockPool",
     "CanonicalKVRef",

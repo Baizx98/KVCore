@@ -1,42 +1,18 @@
-from kvcore.kv import BlockAllocator, BlockPool, BlockTable, KVManager, RequestKVView
+from kvcore.kv import BlockPool, BlockTable, KVManager
 
 
-def test_block_allocator_reuses_released_ids() -> None:
-    allocator = BlockAllocator()
+def test_block_pool_reuses_released_ids() -> None:
+    pool = BlockPool(capacity=4)
 
-    first = allocator.allocate_block_id()
-    second = allocator.allocate_block_id()
-    allocator.release_block_id(first)
+    first = pool.allocate_block().block_id
+    second = pool.allocate_block().block_id
+    pool.release_block_id(first)
+    third = pool.allocate_block().block_id
+    reused = pool.allocate_block().block_id
 
-    reused = allocator.allocate_block_id()
-
-    assert second == 1
+    assert second == 2
+    assert third == 3
     assert reused == first
-
-
-def test_request_kv_view_grows_and_releases() -> None:
-    allocator = BlockAllocator()
-    view = RequestKVView.from_token_count(
-        seq_id="req-1",
-        total_tokens=17,
-        num_layers=2,
-        block_size=16,
-        allocator=allocator,
-    )
-
-    assert view.total_block_count == 4
-    assert view.layer_states[0].blocks[-1].token_end == 17
-
-    view.update_total_tokens(33, allocator)
-
-    assert view.total_block_count == 6
-    assert view.layer_states[0].blocks[-1].token_start == 32
-    assert view.layer_states[0].blocks[-1].token_end == 33
-
-    view.release(allocator)
-
-    assert view.total_block_count == 0
-    assert view.total_tokens == 0
 
 
 def test_kv_manager_uses_one_single_type_manager_per_layer() -> None:

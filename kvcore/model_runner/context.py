@@ -1,4 +1,4 @@
-"""Execution context objects for the explicit layer-wise runtime."""
+"""Execution context objects owned by the model runner package."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class AttentionParams:
 
 @dataclass(slots=True)
 class LayerContext:
-    """Per-layer execution context exposed to the runner and future hooks."""
+    """Per-layer execution context exposed to the runner and hooks."""
 
     layer_id: int
     request_id: str
@@ -54,7 +54,7 @@ class LayerContext:
 
 @dataclass(slots=True)
 class BatchContext:
-    """A minimal batch context for the current single-request path."""
+    """Minimal batch context for the current single-request path."""
 
     request_id: str
     sequence_state: SequenceState
@@ -64,7 +64,7 @@ class BatchContext:
 
 @dataclass(slots=True)
 class StepOutput:
-    """Outputs produced by one explicit runner step."""
+    """Outputs produced by one explicit model-runner step."""
 
     logits: Any
     past_key_values: Any

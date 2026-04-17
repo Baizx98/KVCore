@@ -1,4 +1,4 @@
-"""Top-level engine that coordinates scheduler, KV management, and model running."""
+"""Internal inference engine that coordinates scheduling and execution."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from kvcore.api.config import EngineConfig, GenerationConfig
 from kvcore.api.types import GenerationResult, Request
 from kvcore.kv import KVManager
 from kvcore.logging import get_logger, setup_logging
-from kvcore.model import LlamaModelAdapter
+from kvcore.model import load_model_from_config
 from kvcore.model_runner import ModelRunner
 from kvcore.scheduler import Scheduler
 
 
 @dataclass(slots=True)
-class LLMEngine:
+class Engine:
     """Coordinate request scheduling, KV management, and model execution."""
 
     config: EngineConfig
@@ -24,17 +24,17 @@ class LLMEngine:
     scheduler: Scheduler = field(default_factory=Scheduler)
 
     @classmethod
-    def from_pretrained(cls, config: EngineConfig | None = None) -> LLMEngine:
+    def from_pretrained(cls, config: EngineConfig | None = None) -> Engine:
         resolved_config = config or EngineConfig()
         setup_logging(resolved_config.log_level)
-        adapter = LlamaModelAdapter.from_config(resolved_config)
+        model = load_model_from_config(resolved_config)
         kv_manager = KVManager.from_model_config(
-            num_layers=adapter.num_hidden_layers,
+            num_layers=model.num_hidden_layers,
             block_size=resolved_config.block_size,
-            device=adapter.device,
+            device=model.device,
         )
         model_runner = ModelRunner(
-            adapter=adapter,
+            model=model,
             block_size=resolved_config.block_size,
             kv_manager=kv_manager,
         )
@@ -45,8 +45,12 @@ class LLMEngine:
         )
 
     @property
+    def model(self) -> Any:
+        return self.model_runner.model
+
+    @property
     def adapter(self) -> Any:
-        return self.model_runner.adapter
+        return self.model
 
     def generate(
         self,

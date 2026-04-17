@@ -6,37 +6,42 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kvcore.logging import get_logger
-from kvcore.runtime.model_runner import SingleRequestModelRunner
+from kvcore.model_runner.context import StepOutput
+from kvcore.model_runner.layer_runner import LayerwiseModelRunner
 
 
 @dataclass(slots=True)
 class ModelRunner:
     """Prepare model inputs, initialize KV cache resources, and execute batches."""
 
-    adapter: Any
+    model: Any
     block_size: int
     kv_manager: Any
-    layer_runner: SingleRequestModelRunner = field(init=False)
+    layer_runner: LayerwiseModelRunner = field(init=False)
 
     def __post_init__(self) -> None:
-        self.layer_runner = SingleRequestModelRunner(
-            adapter=self.adapter,
+        self.layer_runner = LayerwiseModelRunner(
+            model=self.model,
             block_size=self.block_size,
         )
 
+    @property
+    def adapter(self) -> Any:
+        return self.model
+
     def profile_run(self) -> dict[str, int | str]:
         return {
-            "num_layers": self.adapter.num_hidden_layers,
+            "num_layers": self.model.num_hidden_layers,
             "block_size": self.block_size,
-            "device": self.adapter.device,
+            "device": self.model.device,
         }
 
-    def run_batch(self, *, scheduled_batch: Any) -> Any:
+    def run_batch(self, *, scheduled_batch: Any) -> StepOutput:
         logger = get_logger("model_runner")
         request_state = scheduled_batch.request_states[0]
 
         if scheduled_batch.mode == "prefill":
-            encoded = self.adapter.encode_prompt(request_state.prompt)
+            encoded = self.model.encode_prompt(request_state.prompt)
             request_state.encoded_inputs = encoded
             request_state.prompt_token_ids = encoded["input_ids"][0].tolist()
             kv_view = self.kv_manager.register_request(
@@ -52,7 +57,7 @@ class ModelRunner:
                 "request_id=%s prompt_tokens=%s layers=%s block_size=%s",
                 request_state.request_id,
                 len(request_state.prompt_token_ids),
-                self.adapter.num_hidden_layers,
+                self.model.num_hidden_layers,
                 self.block_size,
             )
             return self.layer_runner.run_prefill(
@@ -61,9 +66,9 @@ class ModelRunner:
                 sequence_state=sequence_state,
             )
 
-        next_input_ids = self.adapter.make_input_ids(
+        next_input_ids = self.model.make_input_ids(
             scheduled_batch.flat_input_ids,
-            device=self.adapter.device,
+            device=self.model.device,
         )
         self.kv_manager.advance_request(
             request_id=request_state.request_id,

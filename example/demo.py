@@ -1,4 +1,4 @@
-from kvcore.api import Engine, EngineConfig, GenerationConfig, Request
+from kvcore.api import EngineConfig, GenerationConfig, LLMEngine, Request
 
 config = EngineConfig(
     model_name_or_path="/Tan/model/Llama-3.2-1B-Instruct",
@@ -9,7 +9,7 @@ config = EngineConfig(
     log_level="INFO",
 )
 
-engine = Engine.from_pretrained(config)
+engine = LLMEngine.from_pretrained(config)
 
 result = engine.generate(
     Request(

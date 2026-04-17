@@ -1,36 +1,37 @@
-"""User-facing engine entry point."""
+"""Public request-facing LLM engine entry point."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from kvcore.api.config import EngineConfig, GenerationConfig
 from kvcore.api.types import GenerationResult, Request
-from kvcore.engine import LLMEngine
+from kvcore.engine import Engine
 
 
 @dataclass(slots=True)
-class Engine:
-    """User-facing wrapper around the top-level LLMEngine."""
+class LLMEngine:
+    """Thin public API wrapper around the internal inference engine."""
 
     config: EngineConfig
-    llm_engine: LLMEngine
+    engine: Engine
 
     @classmethod
-    def from_pretrained(cls, config: EngineConfig | None = None) -> Engine:
-        llm_engine = LLMEngine.from_pretrained(config)
-        return cls(config=llm_engine.config, llm_engine=llm_engine)
+    def from_pretrained(cls, config: EngineConfig | None = None) -> LLMEngine:
+        engine = Engine.from_pretrained(config)
+        return cls(config=engine.config, engine=engine)
 
     @property
-    def adapter(self):
-        return self.llm_engine.adapter
+    def model(self) -> Any:
+        return self.engine.model
 
     def generate(
         self,
         request: Request,
         generation_config: GenerationConfig | None = None,
     ) -> GenerationResult:
-        return self.llm_engine.generate(
+        return self.engine.generate(
             request=request,
             generation_config=generation_config,
         )

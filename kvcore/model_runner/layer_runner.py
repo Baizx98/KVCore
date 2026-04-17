@@ -1,4 +1,4 @@
-"""Single-request explicit layer-wise model runner."""
+"""Single-request explicit layer-wise runner."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 from kvcore.kv import BlockTable, RequestKVView
 from kvcore.logging import get_logger
-from kvcore.runtime.context import (
+from kvcore.model_runner.context import (
     AttentionParams,
     BatchContext,
     LayerContext,
@@ -17,10 +17,10 @@ from kvcore.runtime.context import (
 
 
 @dataclass(slots=True)
-class SingleRequestModelRunner:
+class LayerwiseModelRunner:
     """Run one request through an explicit layer-by-layer reference path."""
 
-    adapter: Any
+    model: Any
     block_size: int
 
     def initialize_sequence_state(
@@ -67,11 +67,9 @@ class SingleRequestModelRunner:
         )
 
     def before_layer(self, layer_context: LayerContext) -> None:
-        """Future hook point before one layer executes."""
         return None
 
     def after_layer(self, layer_context: LayerContext) -> None:
-        """Future hook point after one layer executes."""
         return None
 
     def _run_step(
@@ -83,8 +81,8 @@ class SingleRequestModelRunner:
         sequence_state: SequenceState,
         is_prefill: bool,
     ) -> StepOutput:
-        logger = get_logger("runtime.runner")
-        prepared_inputs = self.adapter.prepare_layer_inputs(
+        logger = get_logger("model_runner.layer_runner")
+        prepared_inputs = self.model.prepare_decoder_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -97,7 +95,7 @@ class SingleRequestModelRunner:
         kv_len = past_seq_len + q_len
         layer_contexts: list[LayerContext] = []
 
-        for layer_id, layer_module in enumerate(self.adapter.iter_layers()):
+        for layer_id, layer_module in enumerate(self.model.iter_layers()):
             layer_kv_state = sequence_state.kv_view.layer_states[layer_id]
             attn_params = self._build_attention_params(
                 hidden_states=hidden_states,
@@ -116,9 +114,9 @@ class SingleRequestModelRunner:
                 attention_params=attn_params,
             )
             self.before_layer(layer_context)
-            self.adapter.before_attention(layer_module=layer_module, layer_context=layer_context)
+            self.model.before_attention(layer_module=layer_module, layer_context=layer_context)
             try:
-                hidden_states = self.adapter.run_layer(
+                hidden_states = self.model.run_layer(
                     layer_module=layer_module,
                     hidden_states=hidden_states,
                     attention_mask=prepared_inputs.causal_mask,
@@ -128,12 +126,12 @@ class SingleRequestModelRunner:
                     attention_params=attn_params,
                 )
             finally:
-                self.adapter.after_attention(layer_module=layer_module, layer_context=layer_context)
+                self.model.after_attention(layer_module=layer_module, layer_context=layer_context)
                 self.after_layer(layer_context)
             layer_contexts.append(layer_context)
 
-        hidden_states = self.adapter.finalize_hidden_states(hidden_states)
-        logits = self.adapter.project_logits(hidden_states)
+        hidden_states = self.model.finalize_hidden_states(hidden_states)
+        logits = self.model.project_logits(hidden_states)
         logger.debug(
             "request_id=%s is_prefill=%s q_len=%s kv_len=%s layers=%s",
             sequence_state.request_id,
@@ -168,7 +166,6 @@ class SingleRequestModelRunner:
         layer_state = sequence_state.kv_view.layer_states[layer_id]
         seq_block_ids = [block.block_id for block in layer_state.blocks]
         seq_block_starts = [block.token_start for block in layer_state.blocks]
-        selected_block_ids = list(seq_block_ids)
         canonical_ref = sequence_state.kv_view.canonical_layer_states[layer_id].ref
         block_table = BlockTable(
             manager_block_size=self.block_size,
@@ -191,7 +188,7 @@ class SingleRequestModelRunner:
             kv_cache_ref=canonical_ref.tensor_name,
             seq_block_ids=seq_block_ids,
             seq_block_starts=seq_block_starts,
-            selected_block_ids=selected_block_ids,
+            selected_block_ids=list(seq_block_ids),
             block_table=block_table,
             kernel_block_ids=block_table.map_to_kernel_blocks(),
         )

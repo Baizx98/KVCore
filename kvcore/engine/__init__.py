@@ -1,5 +1,5 @@
-"""Top-level engine coordination."""
+"""Internal engine coordination."""
 
-from kvcore.engine.llm_engine import LLMEngine
+from kvcore.engine.engine import Engine
 
-__all__ = ["LLMEngine"]
+__all__ = ["Engine"]

@@ -9,8 +9,7 @@ from typing import Any
 from kvcore.api.config import GenerationConfig
 from kvcore.api.types import GenerationResult, Request
 from kvcore.logging import get_logger
-from kvcore.scheduler.batch import ScheduledBatch
-from kvcore.scheduler.request_state import RequestState
+from kvcore.scheduler.state import RequestState, ScheduledBatch
 
 
 @dataclass(slots=True)
@@ -61,6 +60,8 @@ class Scheduler:
             request_state.sequence_state = step_output.batch_context.sequence_state
 
         request_state.generated_token_ids.append(next_token_id)
+        if request_state.sequence_state is not None:
+            request_state.sequence_state.generated_token_ids.append(next_token_id)
         request_state.past_key_values = step_output.past_key_values
 
         eos_token_ids = _resolve_eos_token_ids(generation_config, model_runner.adapter.tokenizer)

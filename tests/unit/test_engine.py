@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from kvcore.api import Engine, EngineConfig, GenerationConfig, Request
+from kvcore.api import EngineConfig, GenerationConfig, LLMEngine, Request
 from kvcore.api.types import GenerationResult
-from kvcore.engine import LLMEngine
+from kvcore.engine import Engine
 from kvcore.kv import KVManager
 from kvcore.model_runner import ModelRunner
 from kvcore.scheduler import Scheduler
@@ -35,7 +35,7 @@ class FakeAdapter:
     def init_cache(self) -> FakeCache:
         return FakeCache()
 
-    def prepare_layer_inputs(
+    def prepare_decoder_inputs(
         self,
         *,
         input_ids: FakeTensor,
@@ -153,9 +153,9 @@ class FakeTensor:
 
 
 @dataclass
-class FakeLLMEngine:
+class FakeEngine:
     config: EngineConfig
-    adapter: FakeAdapter
+    model: FakeAdapter
     result: GenerationResult
 
     def generate(
@@ -166,7 +166,7 @@ class FakeLLMEngine:
         return self.result
 
 
-def test_engine_delegates_to_llm_engine() -> None:
+def test_api_llm_engine_delegates_to_internal_engine() -> None:
     expected = GenerationResult(
         text="ok",
         token_ids=[1, 2],
@@ -178,13 +178,13 @@ def test_engine_delegates_to_llm_engine() -> None:
         kv_block_count=2,
         kv_total_tokens=2,
     )
-    engine = Engine(
+    engine = LLMEngine(
         config=EngineConfig(),
-        llm_engine=cast(
-            LLMEngine,
-            FakeLLMEngine(
+        engine=cast(
+            Engine,
+            FakeEngine(
                 config=EngineConfig(),
-                adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+                model=FakeAdapter(tokenizer=FakeTokenizer()),
                 result=expected,
             ),
         ),
@@ -195,12 +195,12 @@ def test_engine_delegates_to_llm_engine() -> None:
     assert result is expected
 
 
-def test_llm_engine_generate_uses_scheduler_kv_manager_and_model_runner() -> None:
+def test_engine_generate_uses_scheduler_kv_manager_and_model_runner() -> None:
     kv_manager = KVManager.from_model_config(num_layers=2, block_size=2, device="cpu")
-    llm_engine = LLMEngine(
+    engine = Engine(
         config=EngineConfig(max_new_tokens=4, block_size=2),
         model_runner=ModelRunner(
-            adapter=FakeAdapter(tokenizer=FakeTokenizer()),
+            model=FakeAdapter(tokenizer=FakeTokenizer()),
             block_size=2,
             kv_manager=kv_manager,
         ),
@@ -208,7 +208,7 @@ def test_llm_engine_generate_uses_scheduler_kv_manager_and_model_runner() -> Non
         scheduler=Scheduler(),
     )
 
-    result = llm_engine.generate(
+    result = engine.generate(
         request=Request(prompt="hello", request_id="req-test"),
         generation_config=GenerationConfig(eos_token_id=3),
     )
