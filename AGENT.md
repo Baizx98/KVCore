@@ -1,56 +1,56 @@
 # AGENT.md
 
-This file defines repository-level working rules for coding agents.
+本文件定义了代码智能体在仓库级别的工作规则。
 
-It is a policy file, not a design document.
-Architecture details belong in `docs/ARCHITECTURE.md`.
-Implementation planning belongs in `docs/IMPLEMENTATION_STAGES.md`.
-
----
-
-## 1. Repository positioning
-
-Treat this repository as a **research-oriented KV-centric LLM inference framework**.
-
-Primary focus:
-
-- KV cache as the core runtime abstraction
-- layer-by-layer execution
-- research-friendly iteration and refactoring
-
-Do not treat this repository as a production serving stack.
+这是策略文件，不是设计文档。
+架构细节应写在 `docs/ARCHITECTURE.md`。
+实现规划应写在 `docs/IMPLEMENTATION_STAGES.md`。
 
 ---
 
-## 2. Current engineering constraints
+## 1. 仓库定位
 
-At the current stage, the project should remain **Python-first**.
+请将本仓库视为一个**面向研究、以 KV 为中心的 LLM 推理框架**。
 
-Rules:
+核心关注点：
 
-- prefer pure Python implementations
-- keep tooling lightweight
-- avoid introducing complex native build systems early
-- if custom GPU kernels become necessary, prefer **Triton** first
-- do not add C++/CUDA extension infrastructure unless explicitly justified by the user
+- 以 KV cache 作为运行时核心抽象
+- 按层执行（layer-by-layer execution）
+- 便于研究迭代与重构
 
-This implies:
-
-- no premature CMake setup
-- no premature `pybind11` / custom extension build pipeline
-- no architecture decisions that assume native extensions are already required
+不要将本仓库当作生产级服务栈。
 
 ---
 
-## 3. Scope constraints
+## 2. 当前工程约束
 
-Current supported model families:
+在当前阶段，项目应保持 **Python-first**。
+
+规则：
+
+- 优先采用纯 Python 实现
+- 工具链保持轻量
+- 避免过早引入复杂的原生构建系统
+- 如确实需要自定义 GPU kernel，优先考虑 **Triton**
+- 未经用户明确说明，不要引入 C++/CUDA 扩展基础设施
+
+这意味着：
+
+- 不要过早搭建 CMake
+- 不要过早引入 `pybind11` / 自定义扩展构建流水线
+- 不要做出“默认必须依赖原生扩展”的架构决策
+
+---
+
+## 3. 范围约束
+
+当前支持的模型家族：
 
 - Qwen3
 - Llama3
 - Mistral3
 
-Current intended feature scope:
+当前目标功能范围：
 
 - PagedAttention
 - Prefix Cache
@@ -62,7 +62,7 @@ Current intended feature scope:
 - block-granularity pruning
 - hook-based KV lifecycle control
 
-Explicitly out of scope unless the user changes direction:
+除非用户改变方向，以下内容明确不在范围内：
 
 - beam search
 - parallel sampling
@@ -74,78 +74,62 @@ Explicitly out of scope unless the user changes direction:
 
 ---
 
-## 4. Design and implementation rules
+## 4. 设计与实现规则
 
-When writing or changing code:
+在编写或修改代码时：
 
-- keep KV metadata and KV data conceptually separate
-- use block/page granularity as the default management unit
-- preserve layer-by-layer control flow
-- keep scheduling policy separate from KV policy when practical
-- prefer clarity, testability, and observability over premature optimization
-- keep changes atomic and easy to review
+- 严格遵循vllm架构的设计
+- 在概念上保持 KV metadata 与 KV data 分离
+- 默认使用 block/page 粒度作为管理单元
+- 保持按层执行的控制流
+- 在可行情况下，将调度策略与 KV 策略解耦
+- 相比过早优化，更优先可读性、可测试性和可观测性
+- 保持改动原子化、易于审查
 
-Additional design guidance:
-
-- borrow core ideas from recent vLLM architecture evolution, especially native KV offload design
-- use `LLMEngine` as the top-level coordinator over API, scheduler, model runner, and KV management
-- keep `ModelRunner` responsible for model loading, buffer initialization, profile runs, and model-executable metadata construction
-- keep `KVManager` as the top-level KV owner, with `BlockPool` managing physical blocks
-- move scheduler outputs toward flattened token-oriented batch metadata where practical
-- keep prefill and decode as separate execution modes until chunked prefill is intentionally implemented
-- treat data transfer as an independent abstraction rather than embedding transport details in attention logic
-- prefer block-id-driven transfer specs over direct tensor-slice-oriented transfer APIs
-- canonicalize model-family-specific KV layout into a shared KV view before offload, pruning, or selection logic consumes it
-- model CPU->GPU and GPU->CPU movement as separate directional handlers rather than one generic move primitive
-- design future offload around reusable pinned-memory CPU pools rather than temporary per-transfer buffers
-- do not assume CPU and GPU block sizes must be identical; granularity differences should be modeled explicitly
-- keep offload coordination aligned with layer execution and hook contexts rather than forcing a large connector framework too early
-- avoid request-granular-only offload design; the long-term target should support request-, layer-, and block-granular movement, with block-granular control as the main path
-
-If the current structure blocks clean implementation, refactoring is allowed.
+若当前结构阻碍清晰实现，允许进行重构。
 
 ---
 
-## 5. Documentation policy
+## 5. 文档策略
 
-All repository documents are **living documents**:
+仓库内所有文档均为**活文档（living documents）**：
 
 - `AGENT.md`
 - `README.md`
-- files under `docs/`
+- `docs/` 目录下文件
 
-Do not assume any existing document is permanently correct.
+不要假设任何现有文档永久正确。
 
-Required behavior:
+必须遵循：
 
-- compare code, docs, and user intent continuously
-- if implementation invalidates existing prose, update the relevant documents
-- do not force code to match stale documentation
-- `AGENT.md` itself may be revised when repository reality changes
+- 持续对比代码、文档与用户意图
+- 若实现使文档表述失效，需更新对应文档
+- 不要强行让代码迁就过期文档
+- 当仓库现实发生变化时，`AGENT.md` 本身也可修订
 
-Priority when conflicts appear:
+当出现冲突时，优先级如下：
 
-1. latest explicit user instruction
-2. cleaner and more maintainable implementation direction
-3. existing repository documents
+1. 用户最新的明确指令
+2. 更清晰、可维护的实现方向
+3. 现有仓库文档
 
 ---
 
-## 6. Development workflow expectations
+## 6. 开发流程期望
 
-Use the repository tooling unless the user asks otherwise:
+除非用户另有要求，使用仓库既有工具链：
 
 - `uv`
 - `ruff`
-- `mypy` in loose mode initially
+- `mypy`
 - `pytest`
 - `pre-commit`
 
-When adding checks or tooling:
+新增检查或工具时：
 
-- start with minimal friction
-- prefer gradual tightening over strict-by-default policies
-- avoid heavyweight infrastructure before the codebase stabilizes
+- 从低摩擦方式开始
+- 优先渐进式收紧，而非默认严格
+- 在代码库稳定前避免引入重量级基础设施
 
-Commit messages should follow the repository convention documented in `docs/DEVELOPMENT.md`.
-Prefer one meaningful atomic change per commit.
+提交信息应遵循 `docs/DEVELOPMENT.md` 中记录的仓库规范。
+优先保证每次提交都是一个有意义的原子改动。
