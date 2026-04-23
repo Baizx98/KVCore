@@ -68,7 +68,8 @@ ForCausalLM
 - `input_ids`
 - `positions`
 - `attn_metadata`
-- `kv_caches`
+
+模型类目前仍保留 `kv_caches` 可选参数作为早期兼容接口，但 ModelRunner 的主路径不再传 per-layer KV cache。
 
 ## Attention Boundary
 
@@ -76,7 +77,8 @@ ForCausalLM
 
 - 模型专属 attention 层负责 Q/K/V projection、RoPE、输出 projection。
 - 通用 `Attention` wrapper 负责 q/k/v 形状标准化、backend 调用、输出 reshape。
-- `Attention.bind_kv_cache()` 将 ModelRunner 初始化的 per-layer KV cache runtime 绑定到 attention 层。
+- Attention 后端后续通过 `attn_metadata.kv_cache_tensor` 和每层 block table
+  定位全局物理 KV 块；ModelRunner 不再绑定 per-layer KV tensor。
 
 当前 backend：
 
@@ -85,7 +87,6 @@ ForCausalLM
 
 当前限制：
 
-- `LayerKVCacheRuntime.update()` 目前只返回输入 key/value。
 - 真实 paged KV 写入、读取和 sparse attention kernel 还没有实现。
 - `attn_metadata` 已经作为接口传递，但 eager backend 只读取 `attention_mask` 和 `is_causal`。
 
@@ -246,23 +247,23 @@ slot_id = block_number * block_size + block_offset
 KV runtime：
 
 - `initialize_kv_cache(kv_manager_config)`
-- `initialize_kv_cache_tensors(kv_manager_config)`
-- `bind_kv_caches_to_model()`
+- `initialize_kv_cache_tensor(kv_manager_config)`
 - `build_block_tables(request_ids, sparse_plan=None)`
 - `build_slot_mapping(block_tables)`
 - `build_attention_metadata(request_ids, sparse_plan=None)`
 
-KV tensor 首版布局：
+KV tensor 首版布局是一块所有层共享的连续大 tensor：
 
 ```text
 [2, num_gpu_blocks, block_size, num_kv_heads, head_size]
 ```
 
+这里 `num_gpu_blocks` 是所有层共享的全局物理块总数。层级差异不体现在 tensor 维度上，而体现在 KVManager 的 per-layer block table 和 ModelRunner 构建的 metadata 中。
+
 `kvcore/model/kv_runtime.py` 定义 runner 侧运行时数据：
 
 - `SparseComputePlan`
 - `KVForwardMetadata`
-- `LayerKVCacheRuntime`
 
 `ModelRunner` 是唯一把 KVManager 的逻辑 block 状态转换为模型/attention backend 输入的地方。
 
@@ -291,11 +292,11 @@ ModelRunner(load_config)
 ```text
 KVLayerSpec per layer
   -> KVManagerConfig
-  -> ModelRunner.initialize_kv_cache()
+  -> Scheduler(KVManagerConfig)
      -> KVManager(config)
-     -> initialize_kv_cache_tensors()
-     -> LayerKVCacheRuntime per layer
-     -> Attention.bind_kv_cache()
+  -> ModelRunner.initialize_kv_cache()
+     -> initialize_kv_cache_tensor()
+     -> shared torch.Tensor KV cache
 ```
 
 ### 3. Add Request
@@ -328,11 +329,11 @@ ModelRunner.build_attention_metadata(request_ids, sparse_plan)
 ### 5. Model Forward
 
 ```text
-model(input_ids, positions, attn_metadata, kv_caches)
+model(input_ids, positions, attn_metadata)
   -> model layers
   -> model-specific attention
   -> generic Attention wrapper
-  -> backend.forward(query, key, value, attn_metadata, kv_cache, layer_idx)
+  -> backend.forward(query, key, value, attn_metadata, layer_idx)
 ```
 
 当前 eager SDPA backend 不真正使用 paged KV block table；后续 paged attention backend 会消费 `KVForwardMetadata`。
@@ -362,7 +363,6 @@ KVManager.free(request)
 
 - No real scheduler-to-runner execution loop yet.
 - No real paged KV cache write/read kernel yet.
-- `LayerKVCacheRuntime.update()` is a placeholder.
 - Sliding-window manager is only an interface skeleton.
 - Attention backend currently uses eager SDPA.
 - `KVForwardMetadata` is constructed but not consumed by a paged backend yet.

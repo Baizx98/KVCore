@@ -75,18 +75,18 @@ This keeps the two mechanisms separate:
 
 ## ModelRunner Responsibilities
 
-`ModelRunner.initialize_kv_cache()` now creates the `KVManager`, initializes KV
-cache tensors, wraps each tensor in a lightweight runtime cache object, and binds
-those cache objects to model `Attention` modules.
+`Scheduler.__init__()` creates and owns the `KVManager`.
+`ModelRunner.initialize_kv_cache()` only initializes the physical KV cache tensor.
+It does not bind per-layer KV tensors to model `Attention` modules.
 
-The first tensor layout is:
+The first tensor layout is one shared storage for all layers:
 
 ```text
 [2, num_blocks, block_size, num_kv_heads, head_size]
 ```
 
-`ModelRunner.build_attention_metadata(request_ids, sparse_plan=None)` reads
-`KVManager.get_blocks()` and emits:
+`ModelRunner.build_attention_metadata(kv_manager, request_ids, sparse_plan=None)` reads
+the scheduler-owned `KVManager.get_blocks()` and emits:
 
 - vLLM-style `MultiGroupBlockTable`
 - per-layer slot mappings
