@@ -32,30 +32,12 @@ class SparseComputePlan:
 class KVForwardMetadata:
     block_tables: MultiGroupBlockTable
     slot_mapping: dict[int, torch.Tensor]
+    kv_cache_tensor: torch.Tensor | None = None
     sparse_plan: SparseComputePlan | None = None
     logical_block_indices: dict[int, tuple[tuple[int, ...], ...]] | None = None
     skipped_block_indices: dict[int, tuple[tuple[int, ...], ...]] | None = None
 
-
-@dataclass(slots=True)
-class LayerKVCacheRuntime:
-    layer_idx: int
-    tensor: torch.Tensor
-
-    def update(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: object | None = None,
-        layer_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The paged write/read kernels are introduced later; for now this object
-        # binds the layer to its KV tensor while preserving eager execution.
-        return key, value
-
-
 __all__ = [
     "KVForwardMetadata",
-    "LayerKVCacheRuntime",
     "SparseComputePlan",
 ]
