@@ -52,6 +52,9 @@ Current execution direction:
 - prefill and decode are handled separately
 - scheduler output should evolve toward flattened token-oriented batch metadata
 - chunked prefill is intentionally deferred until the core engine, scheduler, and KV boundaries stabilize
+- `torch_paged` is the slow correctness reference for paged KV semantics
+- `triton_paged` is the current CUDA paged attention runtime path
+- `ModelRunner.profile_run` estimates the KV block budget from the current device
 
 ---
 

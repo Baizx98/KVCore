@@ -13,7 +13,13 @@ KVCore 当前已经形成了一个 vLLM 风格但更精简的推理骨架：
 - `kv` 负责 KV block 生命周期、prefix cache、永久驱逐和 block table。
 - `model_runner` 是运行时边界，负责 KV tensor 初始化、绑定、block table/slot mapping/attention metadata 构造。
 
-当前还没有完整 scheduler/engine 执行循环，`engine` 和 `sched` 仍是后续接入点。
+当前已经有最小 scheduler/engine 执行循环：
+
+- `EngineCore.step()` 串起调度、模型执行、采样和请求状态更新。
+- `Scheduler` 负责 waiting/running 队列、prefill continuation、decode priority 和逻辑 KV block 分配。
+- `ModelRunner.execute_model()` 负责构造 flattened runtime input、paged attention metadata、模型 forward、logits 和 sampler。
+
+仍未完成的是高覆盖真实模型验证、性能 profiling、复杂 preemption/offload，以及与 vLLM 生产路径同等级的 kernel 优化。
 
 ## Request And Sampling
 
@@ -69,7 +75,8 @@ ForCausalLM
 - `positions`
 - `attn_metadata`
 
-模型类目前仍保留 `kv_caches` 可选参数作为早期兼容接口，但 ModelRunner 的主路径不再传 per-layer KV cache。
+模型类不再接收 `kv_caches` 参数。和 vLLM 当前主线的分层类似，模型 forward 只接收 tokens/positions/runtime metadata；KV cache 不作为 per-layer 参数从模型入口注入。
+KVCore 的差异是：当前只有一个全局共享大 KV tensor，因此 attention backend 通过 `PagedAttentionMetadata.kv_cache_tensor + block_tables + slot_mapping + layer_idx` 定位本层读写位置。
 
 ## Attention Boundary
 
@@ -83,12 +90,14 @@ ForCausalLM
 当前 backend：
 
 - `kvcore/model/attn_backend/base.py` 定义协议。
-- `kvcore/model/attn_backend/torch_sdpa.py` 提供 eager SDPA backend。
+- `kvcore/model/attn_backend/torch_paged.py` 提供低性能但语义正确的 paged attention reference backend。
+- `kvcore/model/attn_backend/triton_paged.py` 提供当前 CUDA paged KV runtime backend。
 
 当前限制：
 
-- 真实 paged KV 写入、读取和 sparse attention kernel 还没有实现。
-- `attn_metadata` 已经作为接口传递，但 eager backend 只读取 `attention_mask` 和 `is_causal`。
+- `torch_paged` 用于 correctness oracle，不用于性能。
+- `triton_paged` 已经支持 paged write 和基于 block table 的 causal attention，但仍需要更大 correctness matrix 和真实模型验证。
+- 原始 `torch_sdpa` backend 已删除，避免非 paged 路径掩盖 KV cache 语义问题。
 
 ## KV Block Pool
 
@@ -263,9 +272,15 @@ KV tensor 首版布局是一块所有层共享的连续大 tensor：
 `kvcore/model/kv_runtime.py` 定义 runner 侧运行时数据：
 
 - `SparseComputePlan`
-- `KVForwardMetadata`
+- `PagedAttentionMetadata`
 
 `ModelRunner` 是唯一把 KVManager 的逻辑 block 状态转换为模型/attention backend 输入的地方。
+
+`ModelRunner.profile_run()` 会生成一次轻量 KV cache profile 结果，`EngineCore` 只保存该结果并把解析后的 block 数交给 `Scheduler/KVManager`：
+
+- 手动设置 `EngineConfig.num_gpu_blocks` 时，runner profile 记录当前配置能支撑的单序列 token 上限。
+- 设置 `EngineConfig.profile_kv_cache=True` 或 `num_gpu_blocks=None` 时，runner 会根据当前设备可用内存和单个 KV block 字节数估算 `num_gpu_blocks`。
+- 该 profile 遵循 vLLM “runner owns model/device/KV tensor profiling” 的职责边界，但不引入 worker/executor 层。
 
 ## Current Execution Flow
 
@@ -323,7 +338,7 @@ ModelRunner.build_attention_metadata(request_ids, sparse_plan)
      -> commit_block_table()
   -> build_slot_mapping()
      -> BlockTable.compute_slot_mapping()
-  -> KVForwardMetadata
+  -> PagedAttentionMetadata
 ```
 
 ### 5. Model Forward
@@ -336,7 +351,10 @@ model(input_ids, positions, attn_metadata)
   -> backend.forward(query, key, value, attn_metadata, layer_idx)
 ```
 
-当前 eager SDPA backend 不真正使用 paged KV block table；后续 paged attention backend 会消费 `KVForwardMetadata`。
+backend 语义分三类：
+
+- `torch_paged`: PyTorch reference backend，按 `slot_mapping` 写共享 KV tensor，并按 block table gather 历史 K/V。
+- `triton_paged`: CUDA runtime backend，目标语义应与 `torch_paged` 对齐。
 
 ### 6. Finish Request
 
@@ -361,8 +379,8 @@ KVManager.free(request)
 
 ## Current Limits
 
-- No real scheduler-to-runner execution loop yet.
-- No real paged KV cache write/read kernel yet.
+- Scheduler-to-runner 最小执行循环已经存在，但还不是完整 vLLM 级别的 serving loop。
 - Sliding-window manager is only an interface skeleton.
-- Attention backend currently uses eager SDPA.
-- `KVForwardMetadata` is constructed but not consumed by a paged backend yet.
+- `torch_paged` 是 correctness reference，性能很低。
+- `triton_paged` 已有 paged KV write/read，但需要更多多请求、GQA、真实模型 logits 对齐测试。
+- 还没有 CPU offload、preemption、speculative decoding、distributed executor、完整 prefix-cache benchmark。
