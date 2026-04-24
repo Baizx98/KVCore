@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from torch import nn
-from transformers import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 
 @dataclass(slots=True)
@@ -39,9 +39,9 @@ class BaseModelLoader:
     def load_model(self) -> nn.Module:
         hf_config = self.load_config_from_source()
         model = self.create_model(hf_config)
-        model_path = self.resolve_model_path()
-        self.load_weights(model, model_path)
         if self.load_config.device is not None:
             model = model.to(self.load_config.device)
+        model_path = self.resolve_model_path()
+        self.load_weights(model, model_path)
         model.eval()
         return model

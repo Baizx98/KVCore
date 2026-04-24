@@ -4,7 +4,7 @@ from collections.abc import Mapping
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:

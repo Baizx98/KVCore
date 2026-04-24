@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 from kvcore.model.attn_backend import AttentionBackend, AttentionType
 from kvcore.model.layer.activation import SiluAndMul
@@ -16,7 +16,6 @@ from kvcore.model.model_utils import (
     infer_batch_and_seq_len,
     load_named_weights,
     prepare_model_inputs,
-    validate_kv_caches,
 )
 
 
@@ -93,7 +92,6 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         *,
         attn_metadata: object | None = None,
-        kv_cache: object | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = infer_batch_and_seq_len(hidden_states)
         input_shape = hidden_states.shape[:-1]
@@ -132,7 +130,6 @@ class LlamaAttention(nn.Module):
             value_states,
             output_shape=torch.Size((*input_shape, self.num_heads * self.head_dim)),
             attn_metadata=attn_metadata,
-            kv_cache=kv_cache,
             layer_idx=self.layer_idx,
         )
         return self.o_proj(attn_output)
@@ -161,7 +158,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         *,
         attn_metadata: object | None = None,
-        kv_cache: object | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -169,7 +165,6 @@ class LlamaDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            kv_cache=kv_cache,
         )
         hidden_states = residual + hidden_states
 
@@ -215,18 +210,14 @@ class Llama3Model(nn.Module):
         *,
         inputs_embeds: torch.Tensor | None = None,
         attn_metadata: object | None = None,
-        kv_caches: list[object | None] | None = None,
     ) -> torch.Tensor:
         hidden_states = prepare_model_inputs(self, input_ids, inputs_embeds)
-        validate_kv_caches(kv_caches, len(self.layers))
 
-        for layer_idx, layer in enumerate(self.layers):
-            layer_kv_cache = None if kv_caches is None else kv_caches[layer_idx]
+        for layer in self.layers:
             hidden_states = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                kv_cache=layer_kv_cache,
             )
 
         return self.norm(hidden_states)
@@ -257,14 +248,12 @@ class Llama3ForCausalLM(nn.Module):
         *,
         inputs_embeds: torch.Tensor | None = None,
         attn_metadata: object | None = None,
-        kv_caches: list[object | None] | None = None,
     ) -> torch.Tensor:
         return self.model(
             input_ids=input_ids,
             positions=positions,
             inputs_embeds=inputs_embeds,
             attn_metadata=attn_metadata,
-            kv_caches=kv_caches,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

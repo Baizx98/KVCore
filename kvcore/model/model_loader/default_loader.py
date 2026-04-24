@@ -5,13 +5,15 @@ import fnmatch
 import json
 import time
 from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors_file
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
+from transformers.models.auto.configuration_auto import AutoConfig
 
 from kvcore.model.model_loader.base import BaseModelLoader
 from kvcore.model.models import (
@@ -64,10 +66,11 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Unsupported model_type={hf_config.model_type!r}. "
                 f"Supported model types: {sorted(MODEL_REGISTRY)}"
             )
-        return model_cls(
-            config=hf_config,
-            attn_backend=self.load_config.attn_backend,
-        )
+        with _temporary_default_dtype(_resolve_model_dtype(hf_config)):
+            return model_cls(
+                config=hf_config,
+                attn_backend=self.load_config.attn_backend,
+            )
 
     def resolve_model_path(self) -> Path:
         candidate = Path(self.load_config.model)
@@ -86,9 +89,9 @@ class DefaultModelLoader(BaseModelLoader):
     def load_model(self) -> nn.Module:
         hf_config = self.load_config_from_source()
         model = self.create_model(hf_config)
-        self.load_weights(model, self.resolve_model_path())
         if self.load_config.device is not None:
             model = model.to(self.load_config.device)
+        self.load_weights(model, self.resolve_model_path())
         model.eval()
         return model
 
@@ -282,3 +285,26 @@ class DefaultModelLoader(BaseModelLoader):
 
 class HuggingFaceModelLoader(DefaultModelLoader):
     """Compatibility alias for the default Hugging Face loader."""
+
+
+def _resolve_model_dtype(hf_config: PretrainedConfig) -> torch.dtype | None:
+    torch_dtype = getattr(hf_config, "torch_dtype", None)
+    if isinstance(torch_dtype, torch.dtype):
+        return torch_dtype
+    if isinstance(torch_dtype, str):
+        return getattr(torch, torch_dtype, None)
+    return None
+
+
+@contextmanager
+def _temporary_default_dtype(dtype: torch.dtype | None):
+    if dtype is None or not dtype.is_floating_point:
+        yield
+        return
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous_dtype)

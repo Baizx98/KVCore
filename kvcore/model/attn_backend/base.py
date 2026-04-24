@@ -22,7 +22,6 @@ class AttentionBackend(Protocol):
         scaling: float,
         is_causal: bool,
         attn_metadata: object | None = None,
-        kv_cache: object | None = None,
         layer_idx: int | None = None,
     ) -> torch.Tensor: ...
 

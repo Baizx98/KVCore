@@ -41,10 +41,6 @@ class Attention(nn.Module):
             )
 
         self.backend_impl = build_attention_backend(attn_backend)
-        self.kv_cache: object | None = None
-
-    def bind_kv_cache(self, kv_cache: object | None) -> None:
-        self.kv_cache = kv_cache
 
     def get_attn_backend(self) -> AttentionBackend:
         return self.backend_impl
@@ -57,7 +53,6 @@ class Attention(nn.Module):
         *,
         output_shape: torch.Size | tuple[int, ...] | None = None,
         attn_metadata: object | None = None,
-        kv_cache: object | None = None,
         layer_idx: int | None = None,
     ) -> torch.Tensor:
         query, key, value, original_rank = self._canonicalize_qkv(query, key, value)
@@ -69,7 +64,6 @@ class Attention(nn.Module):
             scaling=self.scale,
             is_causal=self.attn_type == AttentionType.DECODER,
             attn_metadata=attn_metadata,
-            kv_cache=self.kv_cache if kv_cache is None else kv_cache,
             layer_idx=layer_idx,
         )
 

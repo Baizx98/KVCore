@@ -49,17 +49,6 @@ def prepare_model_inputs(
     return module.embed_input_ids(input_ids)
 
 
-def validate_kv_caches(
-    kv_caches: list[object | None] | None,
-    num_layers: int,
-) -> None:
-    if kv_caches is not None and len(kv_caches) != num_layers:
-        raise ValueError(
-            "kv_caches must match the number of decoder layers, "
-            f"got {len(kv_caches)} caches for {num_layers} layers"
-        )
-
-
 def infer_batch_and_seq_len(hidden_states: torch.Tensor) -> tuple[int, int]:
     if hidden_states.dim() == 2:
         return 1, hidden_states.size(0)

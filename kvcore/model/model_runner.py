@@ -1,28 +1,38 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 from kvcore.kv.block_table import MultiGroupBlockTable
 from kvcore.kv.kv_manager import KVManager, KVManagerConfig
-from kvcore.model.kv_runtime import (
-    KVForwardMetadata,
-    SparseComputePlan,
-)
+from kvcore.kv.single_type_kv_manager import KVLayerSpec
+from kvcore.model.kv_runtime import PagedAttentionMetadata
 from kvcore.model.model_loader import DefaultModelLoader, ModelLoadConfig
+from kvcore.sample import Sampler
+from kvcore.sched.utils import SchedulerOutput
+
+
+@dataclass(frozen=True, slots=True)
+class KVCacheProfileResult:
+    num_gpu_blocks: int
+    block_size: int
+    bytes_per_block: int
+    available_memory_bytes: int | None
+    memory_budget_bytes: int | None
+    max_tokens_per_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStepOutput:
+    sampled_request_ids: tuple[str, ...]
+    sampled_token_ids: tuple[int, ...]
 
 
 class ModelRunner:
-    """Owns model creation and weight loading for the current process.
-
-    This intentionally only covers the vLLM-like early lifecycle:
-    create model skeleton -> load weights.
-    Runtime concerns such as profiling, KV cache allocation, and execution
-    loops are deferred to later work.
-    """
+    """Owns model creation, weight loading, and single-step execution."""
 
     def __init__(self, load_config: ModelLoadConfig) -> None:
         self.load_config = load_config
@@ -31,6 +41,7 @@ class ModelRunner:
         self.model: nn.Module | None = None
         self.kv_manager_config: KVManagerConfig | None = None
         self.kv_cache_tensor: torch.Tensor | None = None
+        self.sampler = Sampler()
 
     def create_model(self) -> nn.Module:
         self.hf_config = self.model_loader.load_config_from_source()
@@ -42,13 +53,39 @@ class ModelRunner:
         self.hf_config = getattr(self.model, "config", None)
         return self.model
 
-    def initialize_kv_cache(self, kv_manager_config: KVManagerConfig) -> torch.Tensor:
-        """Create one global physical KV cache tensor.
+    def profile_run(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        block_size: int,
+        max_model_len: int,
+        requested_num_gpu_blocks: int | None,
+        should_profile: bool,
+        gpu_memory_utilization: float,
+    ) -> KVCacheProfileResult:
+        """Resolve KV block capacity from runner-owned model/device state.
 
-        The scheduler owns the logical KVManager. ModelRunner only owns the
-        runtime tensor and metadata needed to execute the model.
+        This is the KVCore equivalent of vLLM keeping profiling in the model
+        runner: the runner owns model/device memory and later owns the physical
+        KV tensor, while the scheduler only receives the resolved block count.
         """
+        if requested_num_gpu_blocks is None or should_profile:
+            num_gpu_blocks = self._estimate_num_gpu_blocks(
+                layer_specs=layer_specs,
+                block_size=block_size,
+                max_model_len=max_model_len,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
+        else:
+            num_gpu_blocks = requested_num_gpu_blocks
+        return self._build_kv_cache_profile_result(
+            layer_specs=layer_specs,
+            block_size=block_size,
+            num_gpu_blocks=num_gpu_blocks,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
 
+    def initialize_kv_cache(self, kv_manager_config: KVManagerConfig) -> torch.Tensor:
         self.kv_manager_config = kv_manager_config
         self.kv_cache_tensor = self.initialize_kv_cache_tensor(kv_manager_config)
         return self.kv_cache_tensor
@@ -57,12 +94,6 @@ class ModelRunner:
         self,
         kv_manager_config: KVManagerConfig,
     ) -> torch.Tensor:
-        """Allocate one contiguous KV cache tensor shared by all layers.
-
-        `num_gpu_blocks` is the global physical block count across all layers.
-        A layer finds its blocks only through block ids in attention metadata.
-        """
-
         device = self._resolve_device()
         first_spec = kv_manager_config.layer_specs[0]
         dtype = first_spec.dtype if isinstance(first_spec.dtype, torch.dtype) else torch.float16
@@ -89,159 +120,206 @@ class ModelRunner:
             device=device,
         )
 
-    def build_block_tables(
+    def prepare_inputs(
         self,
-        kv_manager: KVManager,
-        request_ids: Sequence[str],
-        sparse_plan: SparseComputePlan | None = None,
-    ) -> MultiGroupBlockTable:
-        max_num_batched_tokens = self._estimate_max_num_batched_tokens(
-            kv_manager,
-            request_ids,
-            sparse_plan,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self._resolve_device()
+        input_ids = torch.tensor(
+            scheduler_output.flat_input_token_ids,
+            dtype=torch.long,
+            device=device,
         )
-        block_tables = MultiGroupBlockTable(
-            max_num_reqs=max(1, len(request_ids)),
-            max_model_len=kv_manager.config.max_model_len,
-            max_num_batched_tokens=max(1, max_num_batched_tokens),
-            pin_memory=False,
-            device=self._resolve_device(),
-            block_sizes=[spec.block_size for spec in kv_manager.config.layer_specs],
-            kernel_block_sizes=[spec.block_size for spec in kv_manager.config.layer_specs],
+        positions = torch.tensor(
+            scheduler_output.flat_positions,
+            dtype=torch.long,
+            device=device,
         )
-        self._last_logical_block_indices: dict[int, tuple[tuple[int, ...], ...]] = {}
-        self._last_skipped_block_indices: dict[int, tuple[tuple[int, ...], ...]] = {}
-
-        per_layer_rows: dict[int, list[list[int]]] = {
-            layer_spec.layer_idx: [] for layer_spec in kv_manager.config.layer_specs
-        }
-        per_layer_logical: dict[int, list[tuple[int, ...]]] = {
-            layer_spec.layer_idx: [] for layer_spec in kv_manager.config.layer_specs
-        }
-        per_layer_skipped: dict[int, list[tuple[int, ...]]] = {
-            layer_spec.layer_idx: [] for layer_spec in kv_manager.config.layer_specs
-        }
-
-        for request_id in request_ids:
-            kv_blocks = kv_manager.get_blocks(request_id)
-            row_block_ids: list[list[int]] = []
-            for layer_spec in kv_manager.config.layer_specs:
-                blocks = kv_blocks.blocks[layer_spec.layer_idx]
-                sparse_indices = (
-                    set()
-                    if sparse_plan is None
-                    else sparse_plan.get_skip_indices(request_id, layer_spec.layer_idx)
-                )
-                block_ids: list[int] = []
-                logical_indices: list[int] = []
-                skipped_indices: list[int] = []
-                for logical_index, block in enumerate(blocks):
-                    if block.is_null or logical_index in sparse_indices:
-                        skipped_indices.append(logical_index)
-                        continue
-                    block_ids.append(block.block_id)
-                    logical_indices.append(logical_index)
-                row_block_ids.append(block_ids)
-                per_layer_rows[layer_spec.layer_idx].append(block_ids)
-                per_layer_logical[layer_spec.layer_idx].append(tuple(logical_indices))
-                per_layer_skipped[layer_spec.layer_idx].append(tuple(skipped_indices))
-            block_tables.add_row(tuple(row_block_ids), len(per_layer_rows[0]) - 1)
-
-        for layer_spec in kv_manager.config.layer_specs:
-            layer_idx = layer_spec.layer_idx
-            self._last_logical_block_indices[layer_idx] = tuple(per_layer_logical[layer_idx])
-            self._last_skipped_block_indices[layer_idx] = tuple(per_layer_skipped[layer_idx])
-
-        block_tables.commit_block_table(len(request_ids))
-        return block_tables
-
-    def build_slot_mapping(
-        self,
-        kv_manager: KVManager,
-        block_tables: MultiGroupBlockTable,
-    ) -> dict[int, torch.Tensor]:
-        slot_mappings: dict[int, torch.Tensor] = {}
-        for layer_idx, block_table in enumerate(block_tables.block_tables):
-            query_start_loc, positions = self._build_query_positions_for_layer(
-                kv_manager,
-                layer_idx,
-            )
-            block_table.compute_slot_mapping(
-                len(query_start_loc) - 1,
-                query_start_loc,
-                positions,
-            )
-            slot_mappings[layer_idx] = block_table.slot_mapping.gpu[: positions.numel()]
-        return slot_mappings
+        return input_ids, positions
 
     def build_attention_metadata(
         self,
         kv_manager: KVManager,
-        request_ids: Sequence[str],
-        sparse_plan: SparseComputePlan | None = None,
-    ) -> KVForwardMetadata:
+        scheduler_output: SchedulerOutput,
+    ) -> PagedAttentionMetadata:
         kv_cache_tensor = self._require_kv_cache_tensor()
-        block_tables = self.build_block_tables(
-            kv_manager,
-            request_ids,
-            sparse_plan=sparse_plan,
-        )
-        return KVForwardMetadata(
-            block_tables=block_tables,
-            slot_mapping=self.build_slot_mapping(kv_manager, block_tables),
-            kv_cache_tensor=kv_cache_tensor,
-            sparse_plan=sparse_plan,
-            logical_block_indices=getattr(self, "_last_logical_block_indices", None),
-            skipped_block_indices=getattr(self, "_last_skipped_block_indices", None),
-        )
-
-    def _estimate_max_num_batched_tokens(
-        self,
-        kv_manager: KVManager,
-        request_ids: Sequence[str],
-        sparse_plan: SparseComputePlan | None,
-    ) -> int:
-        max_tokens = 0
-        for request_id in request_ids:
-            kv_blocks = kv_manager.get_blocks(request_id)
-            for layer_spec in kv_manager.config.layer_specs:
-                sparse_indices = (
-                    set()
-                    if sparse_plan is None
-                    else sparse_plan.get_skip_indices(request_id, layer_spec.layer_idx)
-                )
-                active_blocks = sum(
-                    not block.is_null and idx not in sparse_indices
-                    for idx, block in enumerate(kv_blocks.blocks[layer_spec.layer_idx])
-                )
-                max_tokens = max(max_tokens, active_blocks * layer_spec.block_size)
-        return max_tokens * max(1, len(request_ids))
-
-    def _build_query_positions_for_layer(
-        self,
-        kv_manager: KVManager,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        logical_by_layer = getattr(self, "_last_logical_block_indices", {})
-        if not logical_by_layer or layer_idx not in logical_by_layer:
-            return (
-                torch.tensor([0], dtype=torch.int64, device=self._resolve_device()),
-                torch.empty(0, dtype=torch.int64, device=self._resolve_device()),
-            )
-
-        block_size = kv_manager.config.layer_specs[layer_idx].block_size
-        query_start_loc = [0]
-        positions: list[int] = []
-        for logical_blocks in logical_by_layer[layer_idx]:
-            for logical_block in logical_blocks:
-                start = logical_block * block_size
-                positions.extend(range(start, start + block_size))
-            query_start_loc.append(len(positions))
+        num_reqs = len(scheduler_output.scheduled_requests)
         device = self._resolve_device()
-        return (
-            torch.tensor(query_start_loc, dtype=torch.int64, device=device),
-            torch.tensor(positions, dtype=torch.int64, device=device),
+
+        block_tables = MultiGroupBlockTable(
+            max_num_reqs=max(1, num_reqs),
+            max_model_len=kv_manager.config.max_model_len,
+            max_num_batched_tokens=max(1, scheduler_output.num_scheduled_tokens),
+            pin_memory=False,
+            device=device,
+            block_sizes=[spec.block_size for spec in kv_manager.config.layer_specs],
+            kernel_block_sizes=[spec.block_size for spec in kv_manager.config.layer_specs],
         )
+
+        query_start_loc = [0]
+        seq_lens: list[int] = []
+        context_lens: list[int] = []
+        query_lens: list[int] = []
+        token_request_indices: list[int] = []
+
+        for request_idx, scheduled_request in enumerate(scheduler_output.scheduled_requests):
+            block_ids = kv_manager.get_block_ids(scheduled_request.request_id)
+            block_tables.add_row(block_ids, request_idx)
+            query_start_loc.append(query_start_loc[-1] + scheduled_request.query_len)
+            seq_lens.append(scheduled_request.context_len + scheduled_request.query_len)
+            context_lens.append(scheduled_request.context_len)
+            query_lens.append(scheduled_request.query_len)
+            token_request_indices.extend([request_idx] * scheduled_request.query_len)
+
+        block_tables.commit_block_table(num_reqs)
+
+        query_start_loc_tensor = torch.tensor(query_start_loc, dtype=torch.int32, device=device)
+        flat_positions = torch.tensor(
+            scheduler_output.flat_positions,
+            dtype=torch.int32,
+            device=device,
+        )
+        slot_mapping: dict[int, torch.Tensor] = {}
+        for layer_idx, block_table in enumerate(block_tables.block_tables):
+            block_table.compute_slot_mapping(
+                num_reqs,
+                query_start_loc_tensor,
+                flat_positions,
+            )
+            slot_mapping[layer_idx] = block_table.slot_mapping.gpu[
+                : scheduler_output.num_scheduled_tokens
+            ]
+
+        return PagedAttentionMetadata(
+            kv_cache_tensor=kv_cache_tensor,
+            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc_tensor,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            context_lens=torch.tensor(context_lens, dtype=torch.int32, device=device),
+            query_lens=torch.tensor(query_lens, dtype=torch.int32, device=device),
+            flat_positions=flat_positions,
+            token_request_indices=torch.tensor(
+                token_request_indices,
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_reqs=num_reqs,
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            num_prefill_reqs=scheduler_output.num_prefill_reqs,
+            num_decode_reqs=scheduler_output.num_decode_reqs,
+            max_query_len=max(query_lens, default=0),
+            max_seq_len=max(seq_lens, default=0),
+        )
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_manager: KVManager,
+    ) -> ModelStepOutput:
+        if scheduler_output.is_empty:
+            return ModelStepOutput((), ())
+
+        model = self._require_model()
+        input_ids, positions = self.prepare_inputs(scheduler_output)
+        attn_metadata = self.build_attention_metadata(kv_manager, scheduler_output)
+        hidden_states = model(
+            input_ids=input_ids,
+            positions=positions,
+            attn_metadata=attn_metadata,
+        )
+
+        sample_indices = [
+            scheduled_request.sample_index
+            for scheduled_request in scheduler_output.scheduled_requests
+            if scheduled_request.should_sample and scheduled_request.sample_index is not None
+        ]
+        if not sample_indices:
+            return ModelStepOutput((), ())
+
+        sample_index_tensor = torch.tensor(
+            sample_indices,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+        sampled_hidden_states = hidden_states.index_select(0, sample_index_tensor)
+        logits = model.compute_logits(sampled_hidden_states)
+        sampled_token_ids = self.sampler.sample(logits, scheduler_output.sampling_params)
+        return ModelStepOutput(
+            sampled_request_ids=tuple(
+                scheduled_request.request_id
+                for scheduled_request in scheduler_output.scheduled_requests
+                if scheduled_request.should_sample
+            ),
+            sampled_token_ids=tuple(int(token_id) for token_id in sampled_token_ids.tolist()),
+        )
+
+    def _estimate_num_gpu_blocks(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        block_size: int,
+        max_model_len: int,
+        gpu_memory_utilization: float,
+    ) -> int:
+        first_spec = layer_specs[0]
+        dtype = first_spec.dtype if isinstance(first_spec.dtype, torch.dtype) else torch.float16
+        bytes_per_block = self._get_bytes_per_block(first_spec, dtype)
+        device = self._resolve_device()
+
+        if device.type == "cuda":
+            free_memory, _total_memory = torch.cuda.mem_get_info(device)
+            budget = int(free_memory * gpu_memory_utilization)
+            return max(1, budget // bytes_per_block)
+
+        blocks_per_layer = (max_model_len + block_size - 1) // block_size
+        return max(1, len(layer_specs) * blocks_per_layer + 1)
+
+    def _build_kv_cache_profile_result(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        block_size: int,
+        num_gpu_blocks: int,
+        gpu_memory_utilization: float,
+    ) -> KVCacheProfileResult:
+        first_spec = layer_specs[0]
+        dtype = first_spec.dtype if isinstance(first_spec.dtype, torch.dtype) else torch.float16
+        bytes_per_block = self._get_bytes_per_block(first_spec, dtype)
+        device = self._resolve_device()
+        available_memory_bytes: int | None = None
+        memory_budget_bytes: int | None = None
+        if device.type == "cuda":
+            free_memory, _total_memory = torch.cuda.mem_get_info(device)
+            available_memory_bytes = int(free_memory)
+            memory_budget_bytes = int(free_memory * gpu_memory_utilization)
+
+        usable_blocks = max(num_gpu_blocks - 1, 0)
+        max_tokens_per_sequence = (usable_blocks // len(layer_specs)) * block_size
+        return KVCacheProfileResult(
+            num_gpu_blocks=num_gpu_blocks,
+            block_size=block_size,
+            bytes_per_block=bytes_per_block,
+            available_memory_bytes=available_memory_bytes,
+            memory_budget_bytes=memory_budget_bytes,
+            max_tokens_per_sequence=max_tokens_per_sequence,
+        )
+
+    @staticmethod
+    def _get_bytes_per_block(layer_spec: KVLayerSpec, dtype: torch.dtype) -> int:
+        return (
+            2
+            * layer_spec.block_size
+            * layer_spec.num_kv_heads
+            * layer_spec.head_size
+            * torch.empty((), dtype=dtype).element_size()
+        )
+
+    def _require_model(self) -> nn.Module:
+        if self.model is None:
+            raise RuntimeError("Model is not initialized. Call create_model/load_model first.")
+        return self.model
 
     def _require_kv_cache_tensor(self) -> torch.Tensor:
         if self.kv_cache_tensor is None:
@@ -262,5 +340,7 @@ class ModelRunner:
 
 
 __all__ = [
+    "KVCacheProfileResult",
     "ModelRunner",
+    "ModelStepOutput",
 ]
