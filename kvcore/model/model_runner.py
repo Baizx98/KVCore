@@ -6,13 +6,16 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
+from kvcore.config import KVCoreConfig, ModelConfig
 from kvcore.kv.block_table import MultiGroupBlockTable
 from kvcore.kv.kv_manager import KVManager, KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
+from kvcore.model.forward_context import ForwardContext, set_forward_context
 from kvcore.model.kv_runtime import PagedAttentionMetadata
 from kvcore.model.model_loader import DefaultModelLoader, ModelLoadConfig
 from kvcore.sample import Sampler
 from kvcore.sched.utils import SchedulerOutput
+from kvcore.utils.sampling_params import SamplingParams
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,12 +34,22 @@ class ModelStepOutput:
     sampled_token_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ModelRunnerInput:
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    attn_metadata: PagedAttentionMetadata
+    sample_indices: tuple[int, ...]
+    sampled_request_ids: tuple[str, ...]
+    sampling_params: tuple[SamplingParams, ...]
+
+
 class ModelRunner:
     """Owns model creation, weight loading, and single-step execution."""
 
-    def __init__(self, load_config: ModelLoadConfig) -> None:
-        self.load_config = load_config
-        self.model_loader = DefaultModelLoader(load_config)
+    def __init__(self, load_config: ModelLoadConfig | ModelConfig | KVCoreConfig) -> None:
+        self.load_config = self._normalize_load_config(load_config)
+        self.model_loader = DefaultModelLoader(self.load_config)
         self.hf_config: PretrainedConfig | None = None
         self.model: nn.Module | None = None
         self.kv_manager_config: KVManagerConfig | None = None
@@ -212,6 +225,34 @@ class ModelRunner:
             max_seq_len=max(seq_lens, default=0),
         )
 
+    def prepare_model_input(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_manager: KVManager,
+    ) -> ModelRunnerInput:
+        input_ids, positions = self.prepare_inputs(scheduler_output)
+        attn_metadata = self.build_attention_metadata(kv_manager, scheduler_output)
+        sample_indices: list[int] = []
+        sampled_request_ids: list[str] = []
+        for scheduled_request in scheduler_output.scheduled_requests:
+            if not scheduled_request.should_sample:
+                continue
+            if scheduled_request.sample_index is None:
+                raise ValueError(
+                    "Scheduled request marked for sampling must provide sample_index: "
+                    f"{scheduled_request.request_id}"
+                )
+            sample_indices.append(scheduled_request.sample_index)
+            sampled_request_ids.append(scheduled_request.request_id)
+        return ModelRunnerInput(
+            input_ids=input_ids,
+            positions=positions,
+            attn_metadata=attn_metadata,
+            sample_indices=tuple(sample_indices),
+            sampled_request_ids=tuple(sampled_request_ids),
+            sampling_params=scheduler_output.sampling_params,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -222,36 +263,26 @@ class ModelRunner:
             return ModelStepOutput((), ())
 
         model = self._require_model()
-        input_ids, positions = self.prepare_inputs(scheduler_output)
-        attn_metadata = self.build_attention_metadata(kv_manager, scheduler_output)
-        hidden_states = model(
-            input_ids=input_ids,
-            positions=positions,
-            attn_metadata=attn_metadata,
-        )
+        model_input = self.prepare_model_input(scheduler_output, kv_manager)
+        with set_forward_context(ForwardContext(attn_metadata=model_input.attn_metadata)):
+            hidden_states = model(
+                input_ids=model_input.input_ids,
+                positions=model_input.positions,
+            )
 
-        sample_indices = [
-            scheduled_request.sample_index
-            for scheduled_request in scheduler_output.scheduled_requests
-            if scheduled_request.should_sample and scheduled_request.sample_index is not None
-        ]
-        if not sample_indices:
+        if not model_input.sample_indices:
             return ModelStepOutput((), ())
 
         sample_index_tensor = torch.tensor(
-            sample_indices,
+            model_input.sample_indices,
             dtype=torch.long,
             device=hidden_states.device,
         )
         sampled_hidden_states = hidden_states.index_select(0, sample_index_tensor)
         logits = model.compute_logits(sampled_hidden_states)
-        sampled_token_ids = self.sampler.sample(logits, scheduler_output.sampling_params)
+        sampled_token_ids = self.sampler.sample(logits, model_input.sampling_params)
         return ModelStepOutput(
-            sampled_request_ids=tuple(
-                scheduled_request.request_id
-                for scheduled_request in scheduler_output.scheduled_requests
-                if scheduled_request.should_sample
-            ),
+            sampled_request_ids=model_input.sampled_request_ids,
             sampled_token_ids=tuple(int(token_id) for token_id in sampled_token_ids.tolist()),
         )
 
@@ -338,9 +369,20 @@ class ModelRunner:
                 pass
         return torch.device("cpu")
 
+    @staticmethod
+    def _normalize_load_config(
+        load_config: ModelLoadConfig | ModelConfig | KVCoreConfig,
+    ) -> ModelLoadConfig:
+        if isinstance(load_config, KVCoreConfig):
+            return load_config.model.to_load_config()
+        if isinstance(load_config, ModelConfig):
+            return load_config.to_load_config()
+        return load_config
+
 
 __all__ = [
     "KVCacheProfileResult",
     "ModelRunner",
+    "ModelRunnerInput",
     "ModelStepOutput",
 ]

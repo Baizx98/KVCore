@@ -12,7 +12,7 @@ def test_logits_processor_projects_hidden_states() -> None:
     lm_head.weight.data.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]))
     hidden_states = torch.tensor([[2.0, 3.0]])
 
-    logits = LogitsProcessor(scale=0.5)(hidden_states, lm_head)
+    logits = LogitsProcessor(scale=0.5)(lm_head, hidden_states)
 
     assert torch.allclose(logits, torch.tensor([[1.0, 1.5, 2.5]]))
 
@@ -21,7 +21,7 @@ def test_logits_processor_can_use_logits_as_input() -> None:
     logits = torch.tensor([[2.0, -2.0]])
     processor = LogitsProcessor(logits_as_input=True, soft_cap=1.0)
 
-    processed = processor(logits)
+    processed = processor(hidden_states=logits)
 
     assert torch.all(processed.abs() <= 1.0)
 

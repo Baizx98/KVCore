@@ -26,6 +26,7 @@ class TorchPagedAttentionBackend:
         is_causal: bool,
         attn_metadata: object | None = None,
         layer_idx: int | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not is_causal:
             raise NotImplementedError(
@@ -34,15 +35,11 @@ class TorchPagedAttentionBackend:
         if layer_idx is None:
             raise ValueError("layer_idx is required for torch paged attention")
         metadata = self._require_metadata(attn_metadata)
-        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-            raise ValueError(
-                "Torch paged attention expects flattened runtime inputs with batch size 1, "
-                f"got query shape {tuple(query.shape)}"
-            )
-
-        query_states = query[0].transpose(0, 1).contiguous()
-        key_states = key[0].transpose(0, 1).contiguous()
-        value_states = value[0].transpose(0, 1).contiguous()
+        query_states, key_states, value_states, direct_flat_input = self._canonicalize_qkv(
+            query,
+            key,
+            value,
+        )
 
         num_tokens, num_query_heads, head_dim = query_states.shape
         if num_tokens != metadata.num_scheduled_tokens:
@@ -76,7 +73,17 @@ class TorchPagedAttentionBackend:
             block_size=block_size,
         )
 
-        output = torch.empty_like(query_states)
+        if output is None:
+            output_states = torch.empty_like(query_states)
+        else:
+            if not direct_flat_input:
+                raise ValueError("output can only be provided with rank-3 flattened q/k/v inputs")
+            output_states = output
+            if output_states.shape != query_states.shape:
+                raise ValueError(
+                    "output shape must match flattened query states, "
+                    f"got {tuple(output_states.shape)} and {tuple(query_states.shape)}"
+                )
         num_queries_per_kv = num_query_heads // num_kv_heads
         for token_idx in range(num_tokens):
             request_idx = int(metadata.token_request_indices[token_idx].item())
@@ -100,12 +107,32 @@ class TorchPagedAttentionBackend:
                     * scaling
                 )
                 probs = torch.softmax(scores, dim=0)
-                output[token_idx, query_head_idx] = torch.matmul(
+                output_states[token_idx, query_head_idx] = torch.matmul(
                     probs,
                     values.to(torch.float32),
-                ).to(output.dtype)
+                ).to(output_states.dtype)
 
-        return output.transpose(0, 1).unsqueeze(0)
+        if direct_flat_input:
+            return output_states
+        return output_states.transpose(0, 1).unsqueeze(0)
+
+    @staticmethod
+    def _canonicalize_qkv(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        if query.dim() == 3:
+            return query.contiguous(), key.contiguous(), value.contiguous(), True
+        if query.dim() == 4 and query.shape[0] == 1:
+            query_states = query[0].transpose(0, 1).contiguous()
+            key_states = key[0].transpose(0, 1).contiguous()
+            value_states = value[0].transpose(0, 1).contiguous()
+            return query_states, key_states, value_states, False
+        raise ValueError(
+            "Torch paged attention expects flattened rank-3 q/k/v or legacy "
+            f"rank-4 q/k/v with batch size 1, got query shape {tuple(query.shape)}"
+        )
 
     @staticmethod
     def _require_metadata(attn_metadata: object | None) -> PagedAttentionMetadata:

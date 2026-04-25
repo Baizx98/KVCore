@@ -15,6 +15,7 @@ from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 
+from kvcore.config import KVCoreConfig, ModelConfig
 from kvcore.model.model_loader.base import BaseModelLoader
 from kvcore.model.models import (
     Llama3ForCausalLM,
@@ -67,10 +68,11 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Supported model types: {sorted(MODEL_REGISTRY)}"
             )
         with _temporary_default_dtype(_resolve_model_dtype(hf_config)):
-            return model_cls(
-                config=hf_config,
-                attn_backend=self.load_config.attn_backend,
+            kvcore_config = KVCoreConfig(
+                model=ModelConfig.from_load_config(self.load_config).with_hf_config(hf_config)
             )
+            model = model_cls(kvcore_config=kvcore_config)
+            return model
 
     def resolve_model_path(self) -> Path:
         candidate = Path(self.load_config.model)

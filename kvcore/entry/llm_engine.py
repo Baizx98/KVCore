@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from kvcore.config import KVCoreConfig
 from kvcore.engine.engine_core import EngineConfig, EngineCore
 from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.utils.sampling_params import SamplingParams
@@ -27,13 +28,16 @@ class GenerationOutput:
 class LLMEngine:
     def __init__(
         self,
-        load_config: ModelLoadConfig,
+        load_config: ModelLoadConfig | KVCoreConfig | None = None,
         engine_config: EngineConfig | None = None,
+        *,
+        config: KVCoreConfig | None = None,
         **core_kwargs,
     ) -> None:
         self.engine_core = EngineCore(
             load_config=load_config,
             engine_config=engine_config,
+            config=config,
             **core_kwargs,
         )
 

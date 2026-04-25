@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from kvcore.config import KVCoreConfig, ModelConfig, RuntimeConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.model.model_loader import ModelLoadConfig
@@ -58,26 +59,23 @@ class FinishedRequestOutput:
 class EngineCore:
     def __init__(
         self,
-        load_config: ModelLoadConfig,
+        load_config: ModelLoadConfig | KVCoreConfig | None = None,
         engine_config: EngineConfig | None = None,
         *,
+        config: KVCoreConfig | None = None,
         model_runner: ModelRunner | None = None,
         tokenizer_manager: TokenizerManager | None = None,
     ) -> None:
+        self.config = self._normalize_config(
+            config=config,
+            load_config=load_config,
+            engine_config=engine_config,
+        )
+        load_config = self.config.model.to_load_config()
         if load_config.attn_backend is None:
-            load_config.attn_backend = (
-                "triton_paged"
-                if (
-                    (load_config.device is None and torch.cuda.is_available())
-                    or (
-                        load_config.device is not None
-                        and torch.device(load_config.device).type == "cuda"
-                    )
-                )
-                else "torch_paged"
-            )
+            load_config.attn_backend = self._default_attn_backend(load_config.device)
         self.load_config = load_config
-        self.engine_config = engine_config or EngineConfig()
+        self.engine_config = self.config.runtime
         self.model_runner = model_runner or ModelRunner(load_config)
         if self.model_runner.model is None:
             self.model_runner.load_model()
@@ -92,10 +90,7 @@ class EngineCore:
         kv_manager_config = self._build_kv_manager_config()
         self.scheduler = Scheduler(
             kv_manager_config,
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=self.engine_config.max_num_seqs,
-                max_num_scheduled_tokens=self.engine_config.max_num_scheduled_tokens,
-            ),
+            scheduler_config=self.config.scheduler,
         )
         self.model_runner.initialize_kv_cache(kv_manager_config)
         self.finished_outputs: dict[str, FinishedRequestOutput] = {}
@@ -173,7 +168,7 @@ class EngineCore:
         hidden_size = config.hidden_size
         head_size = getattr(config, "head_dim", hidden_size // num_attention_heads)
         max_model_len = (
-            self.engine_config.max_model_len
+            self.config.runtime.max_model_len
             or getattr(config, "max_position_embeddings", None)
             or getattr(config, "max_model_len", None)
         )
@@ -184,7 +179,7 @@ class EngineCore:
         layer_specs = tuple(
             KVLayerSpec(
                 layer_idx=layer_idx,
-                block_size=self.engine_config.block_size,
+                block_size=self.config.runtime.block_size,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
                 dtype=param_dtype,
@@ -193,11 +188,11 @@ class EngineCore:
         )
         self.kv_cache_profile = self.model_runner.profile_run(
             layer_specs=layer_specs,
-            block_size=self.engine_config.block_size,
+            block_size=self.config.runtime.block_size,
             max_model_len=max_model_len,
-            requested_num_gpu_blocks=self.engine_config.num_gpu_blocks,
-            should_profile=self.engine_config.profile_kv_cache,
-            gpu_memory_utilization=self.engine_config.gpu_memory_utilization,
+            requested_num_gpu_blocks=self.config.runtime.num_gpu_blocks,
+            should_profile=self.config.runtime.profile_kv_cache,
+            gpu_memory_utilization=self.config.runtime.gpu_memory_utilization,
         )
 
         return KVManagerConfig(
@@ -215,6 +210,52 @@ class EngineCore:
         elif isinstance(eos_token_id, (list, tuple)):
             stop_token_ids.update(int(token_id) for token_id in eos_token_id)
         return stop_token_ids
+
+    @classmethod
+    def _normalize_config(
+        cls,
+        *,
+        config: KVCoreConfig | None,
+        load_config: ModelLoadConfig | KVCoreConfig | None,
+        engine_config: EngineConfig | None,
+    ) -> KVCoreConfig:
+        if isinstance(load_config, KVCoreConfig):
+            if config is not None:
+                raise ValueError("KVCoreConfig was provided twice")
+            config = load_config
+            load_config = None
+        if config is not None:
+            if load_config is not None or engine_config is not None:
+                raise ValueError(
+                    "Pass either KVCoreConfig or legacy load_config/engine_config, not both."
+                )
+            return config
+        if load_config is None:
+            raise ValueError("load_config is required when KVCoreConfig is not provided")
+
+        legacy_engine_config = engine_config or EngineConfig()
+        return KVCoreConfig(
+            model=ModelConfig.from_load_config(load_config),
+            runtime=RuntimeConfig(
+                block_size=legacy_engine_config.block_size,
+                num_gpu_blocks=legacy_engine_config.num_gpu_blocks,
+                max_model_len=legacy_engine_config.max_model_len,
+                profile_kv_cache=legacy_engine_config.profile_kv_cache,
+                gpu_memory_utilization=legacy_engine_config.gpu_memory_utilization,
+            ),
+            scheduler=SchedulerConfig(
+                max_num_seqs=legacy_engine_config.max_num_seqs,
+                max_num_scheduled_tokens=legacy_engine_config.max_num_scheduled_tokens,
+            ),
+        )
+
+    @staticmethod
+    def _default_attn_backend(device: str | None) -> str:
+        if (device is None and torch.cuda.is_available()) or (
+            device is not None and torch.device(device).type == "cuda"
+        ):
+            return "triton_paged"
+        return "torch_paged"
 
 
 __all__ = [

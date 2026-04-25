@@ -29,16 +29,20 @@ class LogitsProcessor(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         lm_head: nn.Module | None = None,
+        hidden_states: torch.Tensor | None = None,
         *,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.logits_as_input:
+            if hidden_states is None:
+                raise ValueError("hidden_states/logits input is required")
             logits = hidden_states
         else:
             if lm_head is None:
                 raise ValueError("lm_head is required when logits_as_input=False")
+            if hidden_states is None:
+                raise ValueError("hidden_states is required when logits_as_input=False")
             logits = lm_head(hidden_states)
             if embedding_bias is not None:
                 logits = logits + embedding_bias

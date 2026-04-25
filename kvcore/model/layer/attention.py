@@ -4,6 +4,8 @@ import torch
 from torch import nn
 
 from kvcore.model.attn_backend import AttentionBackend, AttentionType, build_attention_backend
+from kvcore.model.forward_context import get_forward_context
+from kvcore.model.model_utils import extract_layer_index
 
 
 class Attention(nn.Module):
@@ -25,6 +27,7 @@ class Attention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         attn_backend: str | AttentionBackend | None = None,
         head_size_v: int | None = None,
+        sliding_window: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -33,6 +36,8 @@ class Attention(nn.Module):
         self.head_size = head_size
         self.head_size_v = self.head_size if head_size_v is None else head_size_v
         self.scale = scale
+        self.layer_idx = extract_layer_index(prefix)
+        self.sliding_window = sliding_window
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError(
@@ -52,11 +57,28 @@ class Attention(nn.Module):
         value: torch.Tensor,
         *,
         output_shape: torch.Size | tuple[int, ...] | None = None,
-        attn_metadata: object | None = None,
-        layer_idx: int | None = None,
     ) -> torch.Tensor:
-        query, key, value, original_rank = self._canonicalize_qkv(query, key, value)
-        attn_output = self.backend_impl.forward(
+        output_dtype = query.dtype
+        if output_shape is None:
+            num_tokens = query.shape[0]
+            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))
+        else:
+            output_shape = torch.Size(output_shape)
+        hidden_size = output_shape[-1]
+        if hidden_size != self.num_heads * self.head_size_v:
+            raise ValueError(
+                "Invalid attention output shape. "
+                f"Expected last dim {self.num_heads * self.head_size_v}, got {hidden_size}"
+            )
+
+        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+        query = query.view(-1, self.num_heads, self.head_size)
+        output_view = output.view(-1, self.num_heads, self.head_size_v)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+        attn_metadata = get_forward_context().attn_metadata
+        output_view = self.backend_impl.forward(
             query,
             key,
             value,
@@ -64,23 +86,11 @@ class Attention(nn.Module):
             scaling=self.scale,
             is_causal=self.attn_type == AttentionType.DECODER,
             attn_metadata=attn_metadata,
-            layer_idx=layer_idx,
+            layer_idx=self.layer_idx,
+            output=output_view,
         )
-
-        if output_shape is None:
-            output_shape = self._infer_output_shape(
-                query=query,
-                original_rank=original_rank,
-            )
-
-        hidden_size = self.num_heads * self.head_size_v
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(*tuple(output_shape))
-        if attn_output.shape[-1] != hidden_size:
-            raise ValueError(
-                "Invalid attention output shape. "
-                f"Expected last dim {hidden_size}, got {attn_output.shape[-1]}"
-            )
-        return attn_output
+        output = output_view.reshape(*tuple(output_shape))
+        return output
 
     def extra_repr(self) -> str:
         return (
@@ -88,32 +98,3 @@ class Attention(nn.Module):
             f"num_kv_heads={self.num_kv_heads}, scale={self.scale}, "
             f"backend={self.backend_impl.__class__.__name__}"
         )
-
-    def _canonicalize_qkv(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        if query.dim() == 4:
-            return query, key, value, 4
-        if query.dim() == 3:
-            query = query.transpose(0, 1).unsqueeze(0)
-            key = key.transpose(0, 1).unsqueeze(0)
-            value = value.transpose(0, 1).unsqueeze(0)
-            return query, key, value, 3
-        raise ValueError(
-            "query/key/value must be rank-3 or rank-4 tensors, "
-            f"got query shape {tuple(query.shape)}"
-        )
-
-    def _infer_output_shape(
-        self,
-        *,
-        query: torch.Tensor,
-        original_rank: int,
-    ) -> torch.Size:
-        hidden_size = self.num_heads * self.head_size_v
-        if original_rank == 3:
-            return torch.Size((query.size(2), hidden_size))
-        return torch.Size((query.size(0), query.size(2), hidden_size))

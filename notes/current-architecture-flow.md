@@ -46,8 +46,10 @@ KVCore 当前已经形成了一个 vLLM 风格但更精简的推理骨架：
 
 `kvcore/model/model_loader` 分三层：
 
-- `ModelLoadConfig`：描述模型路径、revision、load format、device、attention backend。
-- `DefaultModelLoader`：读取 HF config，按 `model_type` 创建模型，遍历 safetensors/bin/pt 权重。
+- `KVCoreConfig`：当前主配置入口，包含 model/runtime/scheduler 三组配置。
+- `ModelConfig.hf_config`：保存 Hugging Face config，模型顶层从 `kvcore_config.model.hf_config` 读取具体 `LlamaConfig/Qwen3Config/MistralConfig`。
+- `ModelLoadConfig`：旧兼容入口，描述模型路径、revision、load format、device、attention backend；进入 `EngineCore` 后会转换到 `KVCoreConfig.model`。
+- `DefaultModelLoader`：读取 HF config，将其注入 `KVCoreConfig.model.hf_config`，再按 `model_type` 创建模型，遍历 safetensors/bin/pt 权重。
 - 模型类自己的 `load_weights()`：完成 HF 权重名到本地参数的加载。
 
 当前模型：
@@ -69,23 +71,28 @@ ForCausalLM
   -> lm_head
 ```
 
-模型 forward 仍是 eager PyTorch 路径，接受：
+模型顶层 forward 仍是 eager PyTorch 路径，只接受：
 
 - `input_ids`
 - `positions`
-- `attn_metadata`
+- `inputs_embeds`
 
-模型类不再接收 `kv_caches` 参数。和 vLLM 当前主线的分层类似，模型 forward 只接收 tokens/positions/runtime metadata；KV cache 不作为 per-layer 参数从模型入口注入。
-KVCore 的差异是：当前只有一个全局共享大 KV tensor，因此 attention backend 通过 `PagedAttentionMetadata.kv_cache_tensor + block_tables + slot_mapping + layer_idx` 定位本层读写位置。
+模型类不再接收 `kv_caches` 或 `attn_metadata` 参数。和 vLLM 当前主线的分层类似，运行态 metadata 由 runner 注入到 forward context，attention 计算时再读取。KVCore 的差异是：当前只有一个全局共享大 KV tensor，因此 attention backend 通过 `PagedAttentionMetadata.kv_cache_tensor + block_tables + slot_mapping + layer_idx` 定位本层读写位置。
+
+模型顶层 `ForCausalLM` 和 family `Model` 接收 `KVCoreConfig`，然后像 vLLM 的 `vllm_config.model_config.hf_config` 一样取出具体 HF config；decoder layer 继续只接收具体的 `LlamaConfig/Qwen3Config/MistralConfig`。模型内部张量语义与 scheduler 对齐：`input_ids`、`positions`、`hidden_states` 都是 flattened token 维度，形状为 `[num_tokens]` 或 `[num_tokens, hidden_size]`。模型 attention 不恢复 `[batch, seq]`，Q/K/V projection 后保持 vLLM 风格的 `[num_tokens, q_size/kv_size]`，由通用 `Attention` wrapper reshape 给 backend。Llama/Qwen/Mistral 使用 packed `qkv_proj` 和 `gate_up_proj`，权重加载时把 HF 的 `q_proj/k_proj/v_proj` 与 `gate_proj/up_proj` 映射进 packed 参数。模型构造路径使用 vLLM 风格 `prefix` 传播层级名，例如 `model.layers.0.self_attn.attn`，attention wrapper 从 prefix 解析 layer index，而不是模型层显式传 `layer_idx`。
+
+Decoder layer forward 显式接收并返回 `residual`，形状与 vLLM Llama 路径一致：`layer(positions, hidden_states, residual) -> (hidden_states, residual)`。最终 norm 使用 `hidden_states, _ = self.norm(hidden_states, residual)`，不再直接 `return self.norm(...)`。
 
 ## Attention Boundary
 
 `kvcore/model/layer/attention.py` 是模型层和 backend 之间的边界：
 
 - 模型专属 attention 层负责 Q/K/V projection、RoPE、输出 projection。
-- 通用 `Attention` wrapper 负责 q/k/v 形状标准化、backend 调用、输出 reshape。
-- Attention 后端后续通过 `attn_metadata.kv_cache_tensor` 和每层 block table
-  定位全局物理 KV 块；ModelRunner 不再绑定 per-layer KV tensor。
+- 通用 `Attention` wrapper 借鉴 vLLM 当前边界：模型侧传入 flattened token 维度的 `query/key/value`，wrapper 推导或接收 `output_shape`，预分配 output buffer，并把 q/k/v view 成 `[num_tokens, heads, head_dim]` 后交给 backend。
+- 通用 `Attention` wrapper 从 `forward_context` 读取 `PagedAttentionMetadata`，并从构造 prefix 解析当前 `layer_idx`。
+- backend 接口显式接收 `attn_metadata`、`layer_idx` 和可选 `output` buffer；`torch_paged`/`triton_paged` 在当前主路径中直接写入这个 rank-3 output buffer，再由 wrapper reshape 回模型期望的最后一维 hidden shape。
+- Attention 后端通过 `attn_metadata.kv_cache_tensor` 和每层 block table 定位全局物理 KV 块；ModelRunner 不再绑定 per-layer KV tensor。
+- `compute_logits()` 通过模型内的 `logits_processor(lm_head, hidden_states)` 计算 logits，采样过滤仍属于 `Sampler`。
 
 当前 backend：
 
@@ -257,9 +264,9 @@ KV runtime：
 
 - `initialize_kv_cache(kv_manager_config)`
 - `initialize_kv_cache_tensor(kv_manager_config)`
-- `build_block_tables(request_ids, sparse_plan=None)`
-- `build_slot_mapping(block_tables)`
-- `build_attention_metadata(request_ids, sparse_plan=None)`
+- `prepare_model_input(scheduler_output, kv_manager)`
+- `build_attention_metadata(kv_manager, scheduler_output)`
+- `execute_model(scheduler_output, kv_manager)`
 
 KV tensor 首版布局是一块所有层共享的连续大 tensor：
 
@@ -273,13 +280,14 @@ KV tensor 首版布局是一块所有层共享的连续大 tensor：
 
 - `SparseComputePlan`
 - `PagedAttentionMetadata`
+- `ForwardContext`
 
 `ModelRunner` 是唯一把 KVManager 的逻辑 block 状态转换为模型/attention backend 输入的地方。
 
 `ModelRunner.profile_run()` 会生成一次轻量 KV cache profile 结果，`EngineCore` 只保存该结果并把解析后的 block 数交给 `Scheduler/KVManager`：
 
-- 手动设置 `EngineConfig.num_gpu_blocks` 时，runner profile 记录当前配置能支撑的单序列 token 上限。
-- 设置 `EngineConfig.profile_kv_cache=True` 或 `num_gpu_blocks=None` 时，runner 会根据当前设备可用内存和单个 KV block 字节数估算 `num_gpu_blocks`。
+- 手动设置 `KVCoreConfig.runtime.num_gpu_blocks` 时，runner profile 记录当前配置能支撑的单序列 token 上限。
+- 设置 `KVCoreConfig.runtime.profile_kv_cache=True` 或 `num_gpu_blocks=None` 时，runner 会根据当前设备可用内存和单个 KV block 字节数估算 `num_gpu_blocks`。
 - 该 profile 遵循 vLLM “runner owns model/device/KV tensor profiling” 的职责边界，但不引入 worker/executor 层。
 
 ## Current Execution Flow
@@ -287,14 +295,14 @@ KV tensor 首版布局是一块所有层共享的连续大 tensor：
 ### 1. Create Or Load Model
 
 ```text
-ModelRunner(load_config)
+ModelRunner(KVCoreConfig | ModelConfig | ModelLoadConfig)
   -> create_model()
      -> DefaultModelLoader.load_config_from_source()
      -> DefaultModelLoader.create_model()
 
 或
 
-ModelRunner(load_config)
+ModelRunner(KVCoreConfig | ModelConfig | ModelLoadConfig)
   -> load_model()
      -> create model
      -> load checkpoint weights
@@ -329,26 +337,29 @@ Request(prompt_token_ids, SamplingParams)
 ### 4. Build Runtime Inputs
 
 ```text
-ModelRunner.build_attention_metadata(request_ids, sparse_plan)
-  -> build_block_tables()
+ModelRunner.prepare_model_input(scheduler_output, kv_manager)
+  -> prepare input_ids / positions
+  -> build_attention_metadata()
      -> KVManager.get_blocks(request_id)
-     -> skip null blocks
-     -> skip SparseComputePlan logical blocks
      -> MultiGroupBlockTable.add_row()
      -> commit_block_table()
-  -> build_slot_mapping()
      -> BlockTable.compute_slot_mapping()
-  -> PagedAttentionMetadata
+  -> ModelRunnerInput(input_ids, positions, PagedAttentionMetadata, sampling metadata)
 ```
 
 ### 5. Model Forward
 
 ```text
-model(input_ids, positions, attn_metadata)
+set_forward_context(ForwardContext(attn_metadata))
+  -> model(input_ids, positions)
   -> model layers
   -> model-specific attention
+     -> q/k/v: [num_tokens, q_size/kv_size]
   -> generic Attention wrapper
-  -> backend.forward(query, key, value, attn_metadata, layer_idx)
+     -> get_forward_context()
+     -> backend.forward(query, key, value, attn_metadata, layer_idx)
+  -> compute_logits(sampled_hidden_states)
+     -> logits_processor(lm_head, hidden_states)
 ```
 
 backend 语义分三类：

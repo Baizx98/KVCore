@@ -6,6 +6,7 @@ import torch
 from safetensors.torch import save_file as save_safetensors_file
 from transformers import LlamaConfig, MistralConfig, Qwen3Config
 
+from kvcore.config import KVCoreConfig, ModelConfig
 from kvcore.model.model_loader import (
     DefaultModelLoader,
     HuggingFaceModelLoader,
@@ -60,6 +61,17 @@ def _make_tiny_mistral_config() -> MistralConfig:
     )
 
 
+def _make_kvcore_config(config, *, attn_backend: str | None = None) -> KVCoreConfig:
+    kvcore_config = KVCoreConfig(
+        model=ModelConfig(
+            model="unused",
+            attn_backend=attn_backend,
+            hf_config=config,
+        )
+    )
+    return kvcore_config
+
+
 def _assert_same_state_dict(model_a, model_b) -> None:
     state_dict_a = model_a.state_dict()
     state_dict_b = model_b.state_dict()
@@ -105,7 +117,7 @@ def test_hf_loader_creates_llama_model_from_local_config(tmp_path: Path) -> None
 
 def test_hf_loader_loads_pytorch_bin_weights(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference_model = Llama3ForCausalLM(_make_tiny_llama_config())
+    reference_model = Llama3ForCausalLM(_make_kvcore_config(_make_tiny_llama_config()))
     model_dir = _write_pretrained_dir(
         tmp_path / "llama_bin",
         reference_model.config,
@@ -127,7 +139,7 @@ def test_hf_loader_loads_pytorch_bin_weights(tmp_path: Path) -> None:
 
 def test_hf_loader_loads_safetensors_weights(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference_model = Qwen3ForCausalLM(_make_tiny_qwen3_config())
+    reference_model = Qwen3ForCausalLM(_make_kvcore_config(_make_tiny_qwen3_config()))
     model_dir = _write_pretrained_dir(
         tmp_path / "qwen3_safe",
         reference_model.config,
@@ -149,7 +161,7 @@ def test_hf_loader_loads_safetensors_weights(tmp_path: Path) -> None:
 
 def test_model_runner_create_model_then_load_model(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference_model = MistralForCausalLM(_make_tiny_mistral_config())
+    reference_model = MistralForCausalLM(_make_kvcore_config(_make_tiny_mistral_config()))
     model_dir = _write_pretrained_dir(
         tmp_path / "mistral_bin",
         reference_model.config,
@@ -172,9 +184,36 @@ def test_model_runner_create_model_then_load_model(tmp_path: Path) -> None:
     _assert_same_state_dict(reference_model, loaded_model)
 
 
+def test_llama_load_weights_stacks_hf_qkv_and_mlp_weights() -> None:
+    config = _make_tiny_llama_config()
+    model = Llama3ForCausalLM(_make_kvcore_config(config))
+    layer = model.model.layers[0]
+    q_weight = torch.full_like(layer.self_attn.qkv_proj.weight[:64], 1.0)
+    k_weight = torch.full_like(layer.self_attn.qkv_proj.weight[64:96], 2.0)
+    v_weight = torch.full_like(layer.self_attn.qkv_proj.weight[96:], 3.0)
+    gate_weight = torch.full_like(layer.mlp.gate_up_proj.weight[:128], 4.0)
+    up_weight = torch.full_like(layer.mlp.gate_up_proj.weight[128:], 5.0)
+
+    model.load_weights(
+        [
+            ("model.layers.0.self_attn.q_proj.weight", q_weight),
+            ("model.layers.0.self_attn.k_proj.weight", k_weight),
+            ("model.layers.0.self_attn.v_proj.weight", v_weight),
+            ("model.layers.0.mlp.gate_proj.weight", gate_weight),
+            ("model.layers.0.mlp.up_proj.weight", up_weight),
+        ]
+    )
+
+    assert torch.equal(layer.self_attn.qkv_proj.weight[:64], q_weight)
+    assert torch.equal(layer.self_attn.qkv_proj.weight[64:96], k_weight)
+    assert torch.equal(layer.self_attn.qkv_proj.weight[96:], v_weight)
+    assert torch.equal(layer.mlp.gate_up_proj.weight[:128], gate_weight)
+    assert torch.equal(layer.mlp.gate_up_proj.weight[128:], up_weight)
+
+
 def test_default_loader_supports_pt_load_format(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference_model = Llama3ForCausalLM(_make_tiny_llama_config())
+    reference_model = Llama3ForCausalLM(_make_kvcore_config(_make_tiny_llama_config()))
     model_dir = _write_pretrained_dir(
         tmp_path / "llama_pt",
         reference_model.config,

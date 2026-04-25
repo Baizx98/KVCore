@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from kvcore.config import KVCoreConfig, ModelConfig, RuntimeConfig
 from kvcore.engine.engine_core import EngineConfig
 from kvcore.entry.llm_engine import LLMEngine
 from kvcore.model.model_loader import ModelLoadConfig
@@ -30,7 +31,7 @@ class FakeTokenizerManager:
 def make_tiny_model_runner(attn_backend: str = "torch_paged") -> ModelRunner:
     load_config = ModelLoadConfig(model="unused", device="cpu", attn_backend=attn_backend)
     runner = ModelRunner(load_config)
-    config = LlamaConfig(
+    hf_config = LlamaConfig(
         vocab_size=64,
         hidden_size=32,
         intermediate_size=64,
@@ -40,7 +41,16 @@ def make_tiny_model_runner(attn_backend: str = "torch_paged") -> ModelRunner:
         max_position_embeddings=64,
         tie_word_embeddings=False,
     )
-    runner.model = Llama3ForCausalLM(config, attn_backend=attn_backend)
+    runner.model = Llama3ForCausalLM(
+        KVCoreConfig(
+            model=ModelConfig(
+                model="unused",
+                device="cpu",
+                attn_backend=attn_backend,
+                hf_config=hf_config,
+            )
+        )
+    )
     return runner
 
 
@@ -73,6 +83,44 @@ def test_llm_engine_generate_returns_text_and_token_ids() -> None:
     assert len(outputs[0].output_token_ids) == 2
     assert isinstance(outputs[0].output_text, str)
     assert outputs[0].finish_reason == "length"
+
+
+def test_llm_engine_accepts_kvcore_config() -> None:
+    engine = LLMEngine(
+        config=KVCoreConfig(
+            model=ModelConfig(model="unused", device="cpu", attn_backend="torch_paged"),
+            runtime=RuntimeConfig(
+                block_size=2,
+                num_gpu_blocks=32,
+                max_model_len=16,
+            ),
+        ),
+        model_runner=make_tiny_model_runner("torch_paged"),
+        tokenizer_manager=FakeTokenizerManager(),
+    )
+
+    assert engine.engine_core.config.model.model == "unused"
+    assert engine.engine_core.config.runtime.block_size == 2
+    assert engine.engine_core.config.scheduler.max_num_seqs == 8
+
+
+def test_legacy_engine_config_is_normalized_to_kvcore_config() -> None:
+    engine = LLMEngine(
+        load_config=ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged"),
+        engine_config=EngineConfig(
+            block_size=4,
+            num_gpu_blocks=16,
+            max_num_seqs=3,
+            max_num_scheduled_tokens=7,
+            max_model_len=16,
+        ),
+        model_runner=make_tiny_model_runner("torch_paged"),
+        tokenizer_manager=FakeTokenizerManager(),
+    )
+
+    assert engine.engine_core.config.runtime.block_size == 4
+    assert engine.engine_core.config.scheduler.max_num_seqs == 3
+    assert engine.engine_core.config.scheduler.max_num_scheduled_tokens == 7
 
 
 def test_llm_engine_single_request_torch_paged_e2e_outputs_text() -> None:

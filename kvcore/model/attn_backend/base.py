@@ -23,6 +23,7 @@ class AttentionBackend(Protocol):
         is_causal: bool,
         attn_metadata: object | None = None,
         layer_idx: int | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
 

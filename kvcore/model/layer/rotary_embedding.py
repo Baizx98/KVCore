@@ -19,8 +19,17 @@ def apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    if query.dim() == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    elif query.dim() == 4:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    else:
+        raise ValueError(
+            "query/key must be rank-3 [tokens, heads, head_dim] or "
+            f"rank-4 [batch, heads, seq, head_dim], got {tuple(query.shape)}"
+        )
     query = (query * cos) + (rotate_half(query) * sin)
     key = (key * cos) + (rotate_half(key) * sin)
     return query, key
@@ -63,46 +72,27 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        *,
-        batch_size: int,
-        seq_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = self._canonicalize_positions(
-            positions,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            device=device,
-        )
-        freqs = positions[..., None].to(torch.float32) * self.inv_freq[None, None, :]
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
-
-    @staticmethod
-    def _canonicalize_positions(
-        positions: torch.Tensor,
-        *,
-        batch_size: int,
-        seq_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        positions = positions.to(device=device)
-        if positions.dim() == 1:
-            if positions.numel() != seq_len:
-                raise ValueError(
-                    f"1D positions must have seq_len={seq_len}, got {positions.numel()}"
-                )
-            return positions.unsqueeze(0).expand(batch_size, -1)
-
-        if positions.dim() == 2:
-            if positions.shape == (batch_size, seq_len):
-                return positions
-            if positions.shape == (1, seq_len):
-                return positions.expand(batch_size, -1)
+        if query.dim() != 2 or key.dim() != 2:
             raise ValueError(
-                "2D positions must have shape "
-                f"({batch_size}, {seq_len}) or (1, {seq_len}), got {tuple(positions.shape)}"
+                "RotaryEmbedding expects flattened q/k tensors with shape "
+                f"[num_tokens, hidden], got {tuple(query.shape)} and {tuple(key.shape)}"
             )
-
-        raise ValueError(f"positions must be 1D or 2D, got shape {tuple(positions.shape)}")
+        positions = positions.to(device=query.device)
+        if positions.dim() != 1 or positions.numel() != query.size(0):
+            raise ValueError(
+                "positions must be rank-1 with one entry per token, "
+                f"got positions shape {tuple(positions.shape)} for {query.size(0)} tokens"
+            )
+        query_shape = query.shape
+        key_shape = key.shape
+        query = query.view(query.size(0), -1, self.head_dim)
+        key = key.view(key.size(0), -1, self.head_dim)
+        freqs = positions[:, None].to(torch.float32) * self.inv_freq[None, :]
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=query.dtype)
+        sin = emb.sin().to(dtype=query.dtype)
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        return query.reshape(query_shape), key.reshape(key_shape)
