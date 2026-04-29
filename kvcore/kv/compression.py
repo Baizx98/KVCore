@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 from kvcore.kv.kv_manager import KVManager
 from kvcore.kv.single_type_kv_manager import LayerBlockSelection
+from kvcore.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +50,26 @@ class RandomKVBlockCompressor:
         kv_manager: KVManager,
         request_ids: tuple[str, ...],
     ) -> KVCompressionResult:
+        logger.info(
+            "Random KV compression begin requests=%d drop_ratio=%.3f max_blocks=%s "
+            "seed=%s",
+            len(request_ids),
+            self.config.drop_ratio,
+            self.config.max_blocks,
+            self.config.seed,
+        )
         selections = self.select_blocks(kv_manager, request_ids)
         eviction_result = kv_manager.evict_request_blocks(selections)
-        return KVCompressionResult(
+        result = KVCompressionResult(
             selections=tuple(selections),
             evicted_block_ids=eviction_result.evicted_block_ids,
         )
+        logger.info(
+            "Random KV compression done selections=%d evicted_blocks=%d",
+            len(result.selections),
+            result.num_evicted_blocks,
+        )
+        return result
 
     def select_blocks(
         self,
@@ -78,6 +95,14 @@ class RandomKVBlockCompressor:
                 if num_to_drop <= 0:
                     continue
                 selected = set(rng.sample(candidate_indices, num_to_drop))
+                logger.debug(
+                    "Random KV compression selected request_id=%s layer=%d "
+                    "candidate_blocks=%d selected=%s",
+                    request_id,
+                    layer_idx,
+                    len(candidate_indices),
+                    tuple(sorted(selected)),
+                )
                 selections.append(
                     LayerBlockSelection(
                         request_id=request_id,

@@ -8,7 +8,10 @@ from kvcore.config import KVCoreConfig
 from kvcore.engine.engine_core import EngineConfig, EngineCore
 from kvcore.entry.llm_engine import GenerationOutput, GenerationRequest, LLMEngine
 from kvcore.model.model_loader import ModelLoadConfig
+from kvcore.utils.log import get_logger
 from kvcore.utils.sampling_params import SamplingParams
+
+logger = get_logger(__name__)
 
 
 class AsyncLLMEngine:
@@ -22,6 +25,7 @@ class AsyncLLMEngine:
         config: KVCoreConfig | None = None,
         **core_kwargs,
     ) -> None:
+        logger.info("Initializing AsyncLLMEngine")
         self.engine_core = EngineCore(
             load_config=load_config,
             engine_config=engine_config,
@@ -35,6 +39,7 @@ class AsyncLLMEngine:
         self,
         requests: Sequence[GenerationRequest | Mapping[str, Any]],
     ) -> list[GenerationOutput]:
+        logger.info("Async generate begin requests=%d", len(requests))
         futures = []
         for request in requests:
             normalized_request = LLMEngine._normalize_request(request)
@@ -46,7 +51,9 @@ class AsyncLLMEngine:
                 )
             )
         await self.run_until_idle()
-        return [await future for future in futures]
+        outputs = [await future for future in futures]
+        logger.info("Async generate done outputs=%d", len(outputs))
+        return outputs
 
     async def submit(
         self,
@@ -66,9 +73,11 @@ class AsyncLLMEngine:
                 sampling_params=sampling_params,
             )
         )
+        logger.info("Async submitted request request_id=%s", request_id)
         return future
 
     async def run_until_idle(self) -> None:
+        logger.debug("Async run_until_idle begin")
         while not self._pending_queue.empty() or self.engine_core.has_unfinished_requests():
             await self._drain_pending_queue()
             if not self.engine_core.has_unfinished_requests():
@@ -79,11 +88,14 @@ class AsyncLLMEngine:
             if not step_output.request_outputs and self.engine_core.has_unfinished_requests():
                 no_progress_state = self.engine_core.scheduler.last_no_progress_state
                 if no_progress_state is not None:
+                    logger.error(no_progress_state.format_message())
                     raise RuntimeError(no_progress_state.format_message())
+                logger.error("Async engine made no scheduling progress")
                 raise RuntimeError(
                     "Engine made no scheduling progress while requests are still unfinished."
                 )
             await asyncio.sleep(0)
+        logger.debug("Async run_until_idle done")
 
     async def _drain_pending_queue(self) -> None:
         while not self._pending_queue.empty():
@@ -93,6 +105,7 @@ class AsyncLLMEngine:
                 messages=request.messages,
                 sampling_params=request.sampling_params,
             )
+            logger.debug("Async drained request request_id=%s", request.request_id)
 
     def _resolve_finished_futures(self) -> None:
         for request_id, future in list(self._futures.items()):
@@ -117,6 +130,7 @@ class AsyncLLMEngine:
                 )
             )
             self._futures.pop(request_id, None)
+            logger.info("Async resolved request request_id=%s", request_id)
 
 
 __all__ = [

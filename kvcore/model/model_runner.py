@@ -16,7 +16,10 @@ from kvcore.model.kv_runtime import PagedAttentionMetadata
 from kvcore.model.model_loader import DefaultModelLoader, ModelLoadConfig
 from kvcore.sample import Sampler
 from kvcore.sched.utils import SchedulerOutput
+from kvcore.utils.log import get_logger
 from kvcore.utils.sampling_params import SamplingParams
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +109,11 @@ class InputBatch:
                     num_computed_tokens=new_request.num_computed_tokens,
                 )
             )
+            logger.debug(
+                "InputBatch added new request req_id=%s prompt_tokens=%d",
+                new_request.req_id,
+                len(new_request.prompt_token_ids),
+            )
         cached_requests = scheduler_output.scheduled_cached_reqs
         for req_index, req_id in enumerate(cached_requests.req_ids):
             state = self.get_request(req_id)
@@ -115,6 +123,13 @@ class InputBatch:
                 state.token_ids.extend(new_token_ids)
             state.block_ids = cached_requests.block_ids[req_index]
             state.num_computed_tokens = num_computed_tokens
+            logger.debug(
+                "InputBatch updated cached request req_id=%s new_tokens=%d "
+                "num_computed_tokens=%d",
+                req_id,
+                len(new_token_ids),
+                num_computed_tokens,
+            )
 
     def add_request(self, request_state: ModelRunnerRequestState) -> None:
         if request_state.req_id in self.req_id_to_index:
@@ -126,12 +141,16 @@ class InputBatch:
         self.requests.append(request_state)
 
     def remove_requests(self, req_ids: tuple[str, ...] | list[str]) -> None:
+        removed = 0
         for req_id in req_ids:
             index = self.req_id_to_index.pop(req_id, None)
             if index is None:
                 continue
             self.requests[index] = None
+            removed += 1
         self._condense()
+        if removed:
+            logger.debug("InputBatch removed requests count=%d", removed)
 
     def _condense(self) -> None:
         active_requests = [request for request in self.requests if request is not None]
@@ -149,6 +168,8 @@ class InputBatch:
         for req_id, token_id in zip(req_ids, token_ids, strict=True):
             state = self.get_request(req_id)
             state.token_ids.append(token_id)
+        if req_ids:
+            logger.debug("InputBatch recorded sampled tokens count=%d", len(req_ids))
 
     def get_request(self, req_id: str) -> ModelRunnerRequestState:
         try:
@@ -174,15 +195,24 @@ class ModelRunner:
         self.input_batch = InputBatch()
         self.sampler = Sampler()
         self.last_step_stats: ModelRunnerStepStats | None = None
+        logger.info(
+            "ModelRunner initialized model=%s device=%s attn_backend=%s",
+            self.load_config.model,
+            self.load_config.device,
+            self.load_config.attn_backend,
+        )
 
     def create_model(self) -> nn.Module:
+        logger.info("Creating model model=%s", self.load_config.model)
         self.hf_config = self.model_loader.load_config_from_source()
         self.model = self.model_loader.create_model(self.hf_config)
         return self.model
 
     def load_model(self) -> nn.Module:
+        logger.info("Loading model model=%s", self.load_config.model)
         self.model = self.model_loader.load_model()
         self.hf_config = getattr(self.model, "config", None)
+        logger.info("Model loaded model=%s", self.load_config.model)
         return self.model
 
     def profile_run(
@@ -210,6 +240,13 @@ class ModelRunner:
             )
         else:
             num_gpu_blocks = requested_num_gpu_blocks
+        logger.info(
+            "ModelRunner profile resolved num_gpu_blocks=%d requested=%s "
+            "should_profile=%s",
+            num_gpu_blocks,
+            requested_num_gpu_blocks,
+            should_profile,
+        )
         return self._build_kv_cache_profile_result(
             layer_specs=layer_specs,
             block_size=block_size,
@@ -220,6 +257,12 @@ class ModelRunner:
     def initialize_kv_cache(self, kv_manager_config: KVManagerConfig) -> torch.Tensor:
         self.kv_manager_config = kv_manager_config
         self.kv_cache_tensor = self.initialize_kv_cache_tensor(kv_manager_config)
+        logger.info(
+            "Initialized KV cache tensor shape=%s dtype=%s device=%s",
+            tuple(self.kv_cache_tensor.shape),
+            self.kv_cache_tensor.dtype,
+            self.kv_cache_tensor.device,
+        )
         return self.kv_cache_tensor
 
     def initialize_kv_cache_tensor(
@@ -290,6 +333,15 @@ class ModelRunner:
                 sampling_params.append(request_state.sampling_params)
         input_ids = torch.tensor(flat_input_token_ids, dtype=torch.long, device=device)
         positions = torch.tensor(flat_positions, dtype=torch.long, device=device)
+        logger.debug(
+            "Prepared model input reqs=%d tokens=%d samples=%d max_query_len=%d "
+            "max_seq_len=%d",
+            len(scheduler_output.scheduled_requests),
+            scheduler_output.total_num_scheduled_tokens,
+            len(sample_indices),
+            max(query_lens, default=0),
+            max(seq_lens, default=0),
+        )
         return ModelRunnerPreparedInput(
             input_ids=input_ids,
             positions=positions,
@@ -351,6 +403,12 @@ class ModelRunner:
                 : scheduler_output.total_num_scheduled_tokens
             ]
 
+        logger.debug(
+            "Built attention metadata reqs=%d tokens=%d layers=%d",
+            num_reqs,
+            scheduler_output.total_num_scheduled_tokens,
+            len(block_tables.block_tables),
+        )
         return PagedAttentionMetadata(
             kv_cache_tensor=kv_cache_tensor,
             block_tables=block_tables,
@@ -400,9 +458,11 @@ class ModelRunner:
         self._update_states(scheduler_output)
         if scheduler_output.is_empty:
             self.last_step_stats = ModelRunnerStepStats(0, 0, 0, 0, 0, 0, 0, 0, 0)
+            logger.debug("ModelRunner skipped empty scheduler output")
             return ModelStepOutput((), ())
         if scheduler_output.total_num_scheduled_tokens == 0:
             self.last_step_stats = ModelRunnerStepStats(0, 0, 0, 0, 0, 0, 0, 0, 0)
+            logger.debug("ModelRunner skipped zero-token scheduler output")
             return ModelStepOutput((), ())
 
         num_zeroed_blocks = self._zero_new_blocks(scheduler_output.new_block_ids_to_zero)
@@ -430,6 +490,21 @@ class ModelRunner:
             sample_time_sec=sample_time,
             num_zeroed_blocks=num_zeroed_blocks,
         )
+        logger.info(
+            "ModelRunner step reqs=%d tokens=%d prefill=%d decode=%d "
+            "samples=%d zeroed_blocks=%d prepare=%.6fs metadata=%.6fs "
+            "forward=%.6fs sample=%.6fs",
+            prepared_input.num_reqs,
+            prepared_input.num_scheduled_tokens,
+            prepared_input.num_prefill_reqs,
+            prepared_input.num_decode_reqs,
+            len(output.sampled_request_ids),
+            num_zeroed_blocks,
+            prepare_time,
+            metadata_time,
+            forward_time,
+            sample_time,
+        )
         return output
 
     def remove_requests(self, request_ids: tuple[str, ...] | list[str]) -> None:
@@ -448,6 +523,7 @@ class ModelRunner:
             device=kv_cache_tensor.device,
         )
         kv_cache_tensor.index_fill_(1, block_id_tensor, 0)
+        logger.debug("Zeroed KV cache blocks count=%d block_ids=%s", len(block_ids), block_ids)
         return len(block_ids)
 
     def _run_forward(self, model_input: ModelRunnerInput) -> torch.Tensor:
@@ -464,6 +540,7 @@ class ModelRunner:
         model_input: ModelRunnerInput,
     ) -> ModelStepOutput:
         if not model_input.sample_indices:
+            logger.debug("Sampling skipped: no sample indices")
             return ModelStepOutput((), ())
 
         sample_index_tensor = torch.tensor(
@@ -477,6 +554,11 @@ class ModelRunner:
         sampled_token_ids = self.sampler.sample(logits, model_input.sampling_params)
         sampled_token_ids_tuple = tuple(int(token_id) for token_id in sampled_token_ids.tolist())
         self.input_batch.record_sampled_tokens(
+            model_input.sampled_request_ids,
+            sampled_token_ids_tuple,
+        )
+        logger.debug(
+            "Sampled tokens request_ids=%s token_ids=%s",
             model_input.sampled_request_ids,
             sampled_token_ids_tuple,
         )

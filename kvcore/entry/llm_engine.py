@@ -7,7 +7,10 @@ from typing import Any
 from kvcore.config import KVCoreConfig
 from kvcore.engine.engine_core import EngineConfig, EngineCore
 from kvcore.model.model_loader import ModelLoadConfig
+from kvcore.utils.log import get_logger
 from kvcore.utils.sampling_params import SamplingParams
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +37,7 @@ class LLMEngine:
         config: KVCoreConfig | None = None,
         **core_kwargs,
     ) -> None:
+        logger.info("Initializing LLMEngine")
         self.engine_core = EngineCore(
             load_config=load_config,
             engine_config=engine_config,
@@ -61,6 +65,7 @@ class LLMEngine:
         requests: Sequence[GenerationRequest | Mapping[str, Any]],
     ) -> list[GenerationOutput]:
         normalized_requests = [self._normalize_request(request) for request in requests]
+        logger.info("LLMEngine generate begin requests=%d", len(normalized_requests))
         for request in normalized_requests:
             self.add_request(
                 request_id=request.request_id,
@@ -71,6 +76,7 @@ class LLMEngine:
         while self.engine_core.has_unfinished_requests():
             step_output = self.step()
             if not step_output.request_outputs and self.engine_core.has_unfinished_requests():
+                logger.error("LLMEngine generate made no progress")
                 raise RuntimeError(
                     "Engine made no scheduling progress while requests are still unfinished. "
                     "This usually means the KV block budget is too small."
@@ -95,6 +101,7 @@ class LLMEngine:
                     ),
                 )
             )
+        logger.info("LLMEngine generate done outputs=%d", len(outputs))
         return outputs
 
     @staticmethod

@@ -21,7 +21,10 @@ from kvcore.sched.utils import (
     SchedulerOutput,
     SchedulerUpdateResult,
 )
+from kvcore.utils.log import get_logger
 from kvcore.utils.request import FinishReason, Request, RequestStatus
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +67,14 @@ class Scheduler:
             kv_manager_config.layer_specs[0].block_size
         )
         self.last_no_progress_state: SchedulerNoProgressState | None = None
+        logger.info(
+            "Scheduler initialized max_num_seqs=%d max_num_scheduled_tokens=%d "
+            "max_partial_prefills=%d max_long_partial_prefills=%d",
+            self.scheduler_config.max_num_seqs,
+            self.scheduler_config.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_partial_prefills,
+            self.scheduler_config.max_long_partial_prefills,
+        )
 
     def add_request(self, request: Request) -> None:
         if request.request_id in self.requests:
@@ -73,15 +84,23 @@ class Scheduler:
             request.update_block_hashes()
         self.requests[request.request_id] = request
         self.waiting.append(request.request_id)
+        logger.info(
+            "Scheduler queued request request_id=%s prompt_tokens=%d max_tokens=%d",
+            request.request_id,
+            request.num_prompt_tokens,
+            request.max_tokens,
+        )
 
     def abort_request(self, request_id: str) -> Request | None:
         request = self.requests.pop(request_id, None)
         if request is None:
+            logger.warning("Scheduler abort ignored for unknown request_id=%s", request_id)
             return None
         self._remove_request_id(self.waiting, request_id)
         self._remove_request_id(self.running, request_id)
         self.kv_manager.free(request)
         request.mark_finished(RequestStatus.FINISHED_ABORTED)
+        logger.info("Scheduler aborted request request_id=%s", request_id)
         return request
 
     def has_unfinished_requests(self) -> bool:
@@ -91,6 +110,12 @@ class Scheduler:
         self.last_no_progress_state = None
         budget = self.scheduler_config.max_num_scheduled_tokens
         max_num_seqs = self.scheduler_config.max_num_seqs
+        logger.debug(
+            "Scheduler step begin waiting=%d running=%d token_budget=%d",
+            len(self.waiting),
+            len(self.running),
+            budget,
+        )
         scheduled_requests: list[ScheduledRequest] = []
         scheduled_new_reqs: list[NewRequestData] = []
         cached_req_ids: list[str] = []
@@ -119,6 +144,10 @@ class Scheduler:
                 num_partial_prefills,
                 num_long_partial_prefills,
             ):
+                logger.debug(
+                    "Skip request due to partial prefill limits request_id=%s",
+                    request_id,
+                )
                 continue
             original_num_computed_tokens = request.num_computed_tokens
             if from_waiting and request.num_computed_tokens == 0:
@@ -134,6 +163,12 @@ class Scheduler:
             chunk_len = min(remaining, budget)
             if from_waiting and self.scheduler_config.reserve_full_prompt_blocks:
                 if not self.kv_manager.can_fit(request, remaining):
+                    logger.debug(
+                        "Skip waiting request due to full prompt reservation "
+                        "request_id=%s remaining=%d",
+                        request_id,
+                        remaining,
+                    )
                     continue
             scheduled = self._schedule_request(
                 request,
@@ -153,6 +188,11 @@ class Scheduler:
             )
             if scheduled is None:
                 request.num_computed_tokens = original_num_computed_tokens
+                logger.debug(
+                    "Stop scheduling after allocation failure request_id=%s chunk_len=%d",
+                    request_id,
+                    chunk_len,
+                )
                 break
             scheduled_requests.append(scheduled)
             if scheduled.is_prefill:
@@ -170,9 +210,21 @@ class Scheduler:
                 max_num_seqs=max_num_seqs,
                 max_num_scheduled_tokens=self.scheduler_config.max_num_scheduled_tokens,
             )
+            logger.warning(self.last_no_progress_state.format_message())
             return SchedulerOutput.empty()
 
         new_block_ids_to_zero = tuple(sorted(set(self.kv_manager.take_new_block_ids())))
+        logger.info(
+            "Scheduler step scheduled reqs=%d tokens=%d prefill=%d decode=%d "
+            "new_reqs=%d cached_reqs=%d zero_blocks=%d",
+            len(scheduled_requests),
+            total_num_scheduled_tokens,
+            sum(1 for s in scheduled_requests if s.is_prefill),
+            sum(1 for s in scheduled_requests if not s.is_prefill),
+            len(scheduled_new_reqs),
+            len(cached_req_ids),
+            len(new_block_ids_to_zero),
+        )
 
         return SchedulerOutput(
             scheduled_requests=tuple(scheduled_requests),
@@ -208,6 +260,13 @@ class Scheduler:
     ) -> KVCompressionResult:
         if request_id not in self.requests:
             raise KeyError(f"Unknown request_id: {request_id}")
+        logger.info(
+            "Compressing KV cache request_id=%s drop_ratio=%.3f seed=%s max_blocks=%s",
+            request_id,
+            drop_ratio,
+            seed,
+            max_blocks,
+        )
         compressor = RandomKVBlockCompressor(
             KVCompressionConfig(
                 drop_ratio=drop_ratio,
@@ -238,6 +297,11 @@ class Scheduler:
             if scheduled_request.should_sample:
                 sampled_token_id = sampled_token_ids[request.request_id]
                 request.append_output_token_ids(sampled_token_id)
+                logger.debug(
+                    "Scheduler consumed sampled token request_id=%s token_id=%d",
+                    request.request_id,
+                    sampled_token_id,
+                )
                 if stop_token_ids is not None and sampled_token_id in stop_token_ids:
                     request.mark_finished(RequestStatus.FINISHED_STOPPED)
                     finished = True
@@ -255,6 +319,12 @@ class Scheduler:
                         )
                     )
                     self._finalize_finished_request(request)
+                    logger.info(
+                        "Request finished request_id=%s reason=%s output_tokens=%d",
+                        request.request_id,
+                        finish_reason.value if finish_reason is not None else None,
+                        request.num_output_tokens,
+                    )
                 else:
                     request.status = RequestStatus.RUNNING
             else:
@@ -304,6 +374,12 @@ class Scheduler:
 
         if not self.kv_manager.can_fit(request, chunk_len, new_computed_blocks):
             request.num_computed_tokens = original_num_computed_tokens
+            logger.debug(
+                "Request cannot fit request_id=%s chunk_len=%d free_blocks=%d",
+                request.request_id,
+                chunk_len,
+                self.kv_manager.block_pool.get_num_free_blocks(),
+            )
             return None
         allocated_blocks = self.kv_manager.allocate_slots(
             request,
@@ -312,12 +388,18 @@ class Scheduler:
         )
         if allocated_blocks is None:
             request.num_computed_tokens = original_num_computed_tokens
+            logger.debug(
+                "KV allocation returned None request_id=%s chunk_len=%d",
+                request.request_id,
+                chunk_len,
+            )
             return None
 
         if from_waiting:
             self._remove_request_id(self.waiting, request.request_id)
             self.running.append(request.request_id)
             request.status = RequestStatus.RUNNING
+            logger.debug("Promoted waiting request request_id=%s", request.request_id)
 
         context_len = request.num_computed_tokens
         is_prefill = request.num_computed_tokens < request.num_prompt_tokens
@@ -355,7 +437,7 @@ class Scheduler:
             cached_should_sample.append(should_sample)
             cached_sample_indices.append(sample_index)
 
-        return ScheduledRequest(
+        scheduled_request = ScheduledRequest(
             request_id=request.request_id,
             is_prefill=is_prefill,
             context_len=context_len,
@@ -365,11 +447,22 @@ class Scheduler:
             num_computed_tokens=context_len,
             block_ids=block_ids,
         )
+        logger.debug(
+            "Scheduled request request_id=%s prefill=%s context_len=%d "
+            "query_len=%d should_sample=%s",
+            request.request_id,
+            is_prefill,
+            context_len,
+            chunk_len,
+            should_sample,
+        )
+        return scheduled_request
 
     def _finalize_finished_request(self, request: Request) -> None:
         self.kv_manager.free(request)
         self._remove_request_id(self.running, request.request_id)
         self.requests.pop(request.request_id, None)
+        logger.debug("Finalized request request_id=%s", request.request_id)
 
     @staticmethod
     def _is_decode_ready(request: Request) -> bool:

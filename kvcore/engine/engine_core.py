@@ -13,9 +13,12 @@ from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.model.model_runner import KVCacheProfileResult, ModelRunner
 from kvcore.sched.scheduler import Scheduler
 from kvcore.sched.utils import RequestStepOutput, SchedulerConfig
+from kvcore.utils.log import get_logger
 from kvcore.utils.request import FinishReason, Request
 from kvcore.utils.sampling_params import SamplingParams
 from kvcore.utils.tokenizer import TokenizerManager
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +89,12 @@ class EngineCore:
         load_config = self.config.model.to_load_config()
         if load_config.attn_backend is None:
             load_config.attn_backend = self._default_attn_backend(load_config.device)
+        logger.info(
+            "Initializing EngineCore model=%s device=%s attn_backend=%s",
+            load_config.model,
+            load_config.device,
+            load_config.attn_backend,
+        )
         self.load_config = load_config
         self.engine_config = self.config.runtime
         self.model_runner = model_runner or ModelRunner(load_config)
@@ -106,6 +115,15 @@ class EngineCore:
         )
         self.model_runner.initialize_kv_cache(kv_manager_config)
         self.finished_outputs: dict[str, FinishedRequestOutput] = {}
+        logger.info(
+            "EngineCore ready num_gpu_blocks=%d block_size=%d max_model_len=%d "
+            "num_layers=%d stop_tokens=%d",
+            kv_manager_config.num_gpu_blocks,
+            self.config.runtime.block_size,
+            kv_manager_config.max_model_len,
+            len(kv_manager_config.layer_specs),
+            len(self.stop_token_ids),
+        )
 
     def add_request(
         self,
@@ -120,10 +138,17 @@ class EngineCore:
             sampling_params=sampling_params,
         )
         self.scheduler.add_request(request)
+        logger.info(
+            "Added request request_id=%s prompt_tokens=%d max_tokens=%d",
+            request_id,
+            len(prompt_token_ids),
+            sampling_params.max_tokens,
+        )
 
     def abort_request(self, request_id: str) -> None:
         request = self.scheduler.abort_request(request_id)
         if request is None:
+            logger.warning("Abort ignored for unknown request_id=%s", request_id)
             return
         self.model_runner.remove_requests([request_id])
         self.finished_outputs[request_id] = FinishedRequestOutput(
@@ -131,6 +156,7 @@ class EngineCore:
             output_token_ids=request.output_token_ids,
             finish_reason=request.get_finished_reason(),
         )
+        logger.info("Aborted request request_id=%s", request_id)
 
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests()
@@ -138,7 +164,15 @@ class EngineCore:
     def step(self) -> EngineCoreOutputs:
         scheduler_output = self.scheduler.schedule()
         if scheduler_output.is_empty:
+            logger.debug("Engine step skipped: scheduler output is empty")
             return EngineCoreOutputs.empty()
+        logger.debug(
+            "Engine step scheduled reqs=%d tokens=%d prefill=%d decode=%d",
+            len(scheduler_output.scheduled_requests),
+            scheduler_output.total_num_scheduled_tokens,
+            scheduler_output.num_prefill_reqs,
+            scheduler_output.num_decode_reqs,
+        )
 
         model_step_output = self.model_runner.execute_model(
             scheduler_output=scheduler_output,
@@ -163,6 +197,12 @@ class EngineCore:
             )
         self.model_runner.remove_requests(
             [finished_request.request_id for finished_request in update_result.finished_requests]
+        )
+        logger.info(
+            "Engine step completed outputs=%d sampled=%d finished=%d",
+            len(update_result.step_outputs),
+            len(model_step_output.sampled_request_ids),
+            len(update_result.finished_requests),
         )
         return EngineCoreOutputs(request_outputs=update_result.step_outputs)
 
@@ -208,6 +248,13 @@ class EngineCore:
             requested_num_gpu_blocks=self.config.runtime.num_gpu_blocks,
             should_profile=self.config.runtime.profile_kv_cache,
             gpu_memory_utilization=self.config.runtime.gpu_memory_utilization,
+        )
+        logger.info(
+            "KV cache profile num_gpu_blocks=%d bytes_per_block=%d "
+            "max_tokens_per_sequence=%d",
+            self.kv_cache_profile.num_gpu_blocks,
+            self.kv_cache_profile.bytes_per_block,
+            self.kv_cache_profile.max_tokens_per_sequence,
         )
 
         return KVManagerConfig(

@@ -14,7 +14,10 @@ from kvcore.kv.single_type_kv_manager import (
     SingleTypeKVManager,
     get_manager_for_kv_cache_spec,
 )
+from kvcore.utils.log import get_logger
 from kvcore.utils.request import Request
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +106,14 @@ class KVManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(len(self.layer_managers)))
         )
+        logger.info(
+            "KVManager initialized num_gpu_blocks=%d max_model_len=%d "
+            "num_layers=%d enable_caching=%s",
+            config.num_gpu_blocks,
+            config.max_model_len,
+            len(self.layer_managers),
+            config.enable_caching,
+        )
 
     @property
     def usage(self) -> float:
@@ -114,6 +125,13 @@ class KVManager:
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         if not self.enable_caching or request.skip_reading_prefix_cache:
+            logger.debug(
+                "Prefix cache lookup skipped request_id=%s enable_caching=%s "
+                "skip_reading_prefix_cache=%s",
+                request.request_id,
+                self.enable_caching,
+                request.skip_reading_prefix_cache,
+            )
             return self.empty_kv_cache_blocks, 0
 
         max_cache_hit_length = max(request.num_tokens - 1, 0)
@@ -137,6 +155,11 @@ class KVManager:
             return self.empty_kv_cache_blocks, 0
 
         hit_length = min(hit_lengths)
+        logger.debug(
+            "Prefix cache lookup request_id=%s hit_length=%d",
+            request.request_id,
+            hit_length,
+        )
         aligned_blocks_by_layer: list[list[KVBlock]] = []
         for manager, layer_hits in zip(self.layer_managers, hit_blocks_by_layer, strict=True):
             num_hit_blocks = hit_length // manager.block_size
@@ -150,10 +173,23 @@ class KVManager:
         num_new_tokens: int,
         new_computed_blocks: KVCacheBlocks | None = None,
     ) -> bool:
-        return (
-            self._get_num_blocks_to_allocate(request, num_new_tokens, new_computed_blocks)
-            <= self.block_pool.get_num_free_blocks()
+        needed_blocks = self._get_num_blocks_to_allocate(
+            request,
+            num_new_tokens,
+            new_computed_blocks,
         )
+        free_blocks = self.block_pool.get_num_free_blocks()
+        can_fit = needed_blocks <= free_blocks
+        logger.debug(
+            "KV can_fit request_id=%s num_new_tokens=%d needed_blocks=%d "
+            "free_blocks=%d can_fit=%s",
+            request.request_id,
+            num_new_tokens,
+            needed_blocks,
+            free_blocks,
+            can_fit,
+        )
+        return can_fit
 
     def allocate_slots(
         self,
@@ -164,6 +200,11 @@ class KVManager:
         if num_new_tokens <= 0:
             raise ValueError(f"num_new_tokens must be positive, got {num_new_tokens}")
         if not self.can_fit(request, num_new_tokens, new_computed_blocks):
+            logger.debug(
+                "KV allocation rejected request_id=%s num_new_tokens=%d",
+                request.request_id,
+                num_new_tokens,
+            )
             return None
 
         new_computed_block_groups = self._normalize_new_computed_blocks(new_computed_blocks)
@@ -188,7 +229,16 @@ class KVManager:
             num_tokens_to_cache = min(num_tokens_need_slot, request.num_tokens)
             self.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks)
+        allocated = self.create_kv_cache_blocks(new_blocks)
+        logger.debug(
+            "KV allocated request_id=%s num_new_tokens=%d num_tokens_need_slot=%d "
+            "layer0_blocks=%s",
+            request.request_id,
+            num_new_tokens,
+            num_tokens_need_slot,
+            allocated.get_layer_block_ids(0) if allocated.blocks else (),
+        )
+        return allocated
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         if not self.enable_caching:
@@ -199,6 +249,7 @@ class KVManager:
     def free(self, request: Request) -> None:
         for manager in self.layer_managers:
             manager.free(request.request_id)
+        logger.debug("KV freed request_id=%s", request.request_id)
 
     def evict_request_blocks(
         self,
@@ -210,7 +261,13 @@ class KVManager:
             layer_results.append(
                 manager.evict_blocks(selection.request_id, set(selection.block_indices))
             )
-        return EvictionResult(tuple(layer_results))
+        result = EvictionResult(tuple(layer_results))
+        logger.info(
+            "KV evicted blocks selections=%d evicted_blocks=%d",
+            len(selections),
+            len(result.evicted_block_ids),
+        )
+        return result
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         return self.create_kv_cache_blocks(
@@ -224,6 +281,8 @@ class KVManager:
         block_ids: list[int] = []
         for manager in self.layer_managers:
             block_ids.extend(manager.take_new_block_ids())
+        if block_ids:
+            logger.debug("KV new block ids to zero count=%d", len(block_ids))
         return block_ids
 
     def create_kv_cache_blocks(

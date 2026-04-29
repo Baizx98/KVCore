@@ -7,6 +7,10 @@ import torch
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from kvcore.utils.log import get_logger
+
+logger = get_logger(__name__)
+
 
 class TokenizerManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
@@ -20,12 +24,14 @@ class TokenizerManager:
         trust_remote_code: bool = False,
         local_files_only: bool = False,
     ) -> TokenizerManager:
+        logger.info("Loading tokenizer model=%s revision=%s", model, revision)
         tokenizer = AutoTokenizer.from_pretrained(
             model,
             revision=revision,
             trust_remote_code=trust_remote_code,
             local_files_only=local_files_only,
         )
+        logger.info("Tokenizer loaded model=%s", model)
         return cls(tokenizer)
 
     def encode_messages(
@@ -53,7 +59,13 @@ class TokenizerManager:
             if len(token_ids) != 1:
                 raise TypeError("Batched chat template output is not supported in KVCore v1")
             token_ids = token_ids[0]
-        return [int(token_id) for token_id in token_ids]
+        result = [int(token_id) for token_id in token_ids]
+        logger.debug(
+            "Encoded messages count=%d token_count=%d",
+            len(messages),
+            len(result),
+        )
+        return result
 
     def decode(
         self,
@@ -63,10 +75,12 @@ class TokenizerManager:
     ) -> str:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
-        return self.tokenizer.decode(
+        result = self.tokenizer.decode(
             list(token_ids),
             skip_special_tokens=skip_special_tokens,
         )
+        logger.debug("Decoded token_count=%d char_count=%d", len(token_ids), len(result))
+        return result
 
     def get_stop_token_ids(self) -> set[int]:
         stop_token_ids: set[int] = set()
