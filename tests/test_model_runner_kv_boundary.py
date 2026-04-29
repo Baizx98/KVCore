@@ -5,13 +5,18 @@ from torch import nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from kvcore.config import KVCoreConfig, ModelConfig
-from kvcore.kv.kv_manager import KVManager, KVManagerConfig
+from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.sched.scheduler import Scheduler
-from kvcore.sched.utils import ScheduledRequest, SchedulerConfig, SchedulerOutput
+from kvcore.sched.utils import (
+    NewRequestData,
+    ScheduledRequest,
+    SchedulerConfig,
+    SchedulerOutput,
+)
 from kvcore.utils.request import Request
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -57,11 +62,15 @@ def make_kv_config(num_layers: int = 2) -> KVManagerConfig:
     )
 
 
-def make_request(request_id: str = "req", token_ids: list[int] | None = None) -> Request:
+def make_request(
+    request_id: str = "req",
+    token_ids: list[int] | None = None,
+    max_tokens: int = 1,
+) -> Request:
     return Request(
         request_id=request_id,
         prompt_token_ids=token_ids or [1, 2, 3, 4, 5, 6],
-        sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0),
     )
 
 
@@ -98,20 +107,32 @@ def make_manual_scheduler_output() -> SchedulerOutput:
             ScheduledRequest(
                 request_id="req",
                 is_prefill=True,
-                flat_start=0,
-                flat_end=2,
                 context_len=0,
                 query_len=2,
                 sample_index=1,
                 should_sample=True,
+                num_computed_tokens=0,
+                block_ids=((1,), (1,)),
             ),
         ),
-        flat_input_token_ids=(7, 8),
-        flat_positions=(0, 1),
-        sampling_params=(SamplingParams(max_tokens=1, temperature=0.0),),
-        num_scheduled_tokens=2,
+        num_scheduled_tokens={"req": 2},
+        total_num_scheduled_tokens=2,
         num_prefill_reqs=1,
         num_decode_reqs=0,
+        new_block_ids_to_zero=(1,),
+        scheduled_new_reqs=(
+            NewRequestData(
+                req_id="req",
+                prompt_token_ids=(7, 8),
+                sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+                block_ids=((1,), (1,)),
+                num_computed_tokens=0,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+                should_sample=True,
+                sample_index=1,
+            ),
+        ),
     )
 
 
@@ -136,7 +157,8 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
 
     scheduler.add_request(make_request())
     scheduler_output = scheduler.schedule()
-    metadata = runner.build_attention_metadata(scheduler.kv_manager, scheduler_output)
+    runner.input_batch.update_from_scheduler_output(scheduler_output)
+    metadata = runner.build_attention_metadata(scheduler_output)
 
     assert metadata.num_reqs == 1
     assert metadata.num_scheduled_tokens == 4
@@ -153,11 +175,10 @@ def test_model_runner_prepares_model_input_from_scheduler_output_fixture() -> No
     runner = make_runner_with_tiny_model()
     kv_config = make_kv_config()
     runner.initialize_kv_cache(kv_config)
-    kv_manager = KVManager(kv_config)
-    request = make_request(token_ids=[7, 8])
-    kv_manager.allocate_slots(request, num_new_tokens=2)
 
-    model_input = runner.prepare_model_input(make_manual_scheduler_output(), kv_manager)
+    scheduler_output = make_manual_scheduler_output()
+    runner.input_batch.update_from_scheduler_output(scheduler_output)
+    model_input = runner.prepare_model_input(scheduler_output)
 
     assert model_input.input_ids.tolist() == [7, 8]
     assert model_input.positions.tolist() == [0, 1]
@@ -166,23 +187,61 @@ def test_model_runner_prepares_model_input_from_scheduler_output_fixture() -> No
     assert model_input.attn_metadata.kv_cache_tensor is runner.kv_cache_tensor
 
 
+def test_model_runner_batch_tracks_chunked_prefill_and_decode_tokens() -> None:
+    runner = make_runner_with_tiny_model()
+    kv_config = make_kv_config()
+    runner.initialize_kv_cache(kv_config)
+    scheduler = Scheduler(
+        kv_config,
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4),
+    )
+    scheduler.add_request(make_request(token_ids=[1, 2, 3, 4, 5, 6], max_tokens=2))
+
+    first = scheduler.schedule()
+    runner.input_batch.update_from_scheduler_output(first)
+    first_input = runner.prepare_model_input(first)
+    assert first_input.input_ids.tolist() == [1, 2, 3, 4]
+    assert first_input.positions.tolist() == [0, 1, 2, 3]
+    assert first_input.sample_indices == ()
+    scheduler.update_from_outputs(first, {})
+
+    second = scheduler.schedule()
+    runner.input_batch.update_from_scheduler_output(second)
+    second_input = runner.prepare_model_input(second)
+    assert second_input.input_ids.tolist() == [5, 6]
+    assert second_input.positions.tolist() == [4, 5]
+    assert second_input.sample_indices == (1,)
+    scheduler.update_from_outputs(second, {"req": 9})
+
+    third = scheduler.schedule()
+    runner.input_batch.update_from_scheduler_output(third)
+    third_input = runner.prepare_model_input(third)
+    assert third_input.input_ids.tolist() == [9]
+    assert third_input.positions.tolist() == [6]
+    assert third_input.sample_indices == (0,)
+
+
 def test_model_runner_execute_model_uses_forward_context_not_model_kwargs() -> None:
     runner = ModelRunner(ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged"))
     spy_model = SpyCausalLM()
     runner.model = spy_model
     kv_config = make_kv_config(num_layers=1)
     runner.initialize_kv_cache(kv_config)
-    kv_manager = KVManager(kv_config)
-    request = make_request(token_ids=[7, 8])
-    kv_manager.allocate_slots(request, num_new_tokens=2)
+    assert runner.kv_cache_tensor is not None
+    runner.kv_cache_tensor.fill_(1)
 
-    step_output = runner.execute_model(make_manual_scheduler_output(), kv_manager)
+    step_output = runner.execute_model(make_manual_scheduler_output())
 
     assert len(spy_model.calls) == 1
     assert spy_model.calls[0]["input_ids"].tolist() == [7, 8]
     assert spy_model.calls[0]["positions"].tolist() == [0, 1]
     assert step_output.sampled_request_ids == ("req",)
     assert step_output.sampled_token_ids == (5,)
+    assert runner.last_step_stats is not None
+    assert runner.last_step_stats.num_reqs == 1
+    assert runner.last_step_stats.num_scheduled_tokens == 2
+    assert runner.last_step_stats.num_zeroed_blocks == 1
+    assert torch.count_nonzero(runner.kv_cache_tensor[:, 1]).item() == 0
 
 
 def test_model_runner_execute_model_samples_requested_positions() -> None:
@@ -196,7 +255,7 @@ def test_model_runner_execute_model_samples_requested_positions() -> None:
 
     scheduler.add_request(make_request(token_ids=[1, 2, 3, 4]))
     scheduler_output = scheduler.schedule()
-    step_output = runner.execute_model(scheduler_output, scheduler.kv_manager)
+    step_output = runner.execute_model(scheduler_output)
 
     assert step_output.sampled_request_ids == ("req",)
     assert len(step_output.sampled_token_ids) == 1

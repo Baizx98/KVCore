@@ -49,9 +49,9 @@ Only decoder-only inference is in scope.
 
 Current execution direction:
 
-- prefill and decode are handled separately
-- scheduler output should evolve toward flattened token-oriented batch metadata
-- chunked prefill is intentionally deferred until the core engine, scheduler, and KV boundaries stabilize
+- scheduler output follows an incremental new/cached request contract
+- `ModelRunner` owns runner-side `InputBatch` state and rebuilds flat execution inputs
+- chunked prefill is supported: middle prompt chunks only write KV, and the last prompt chunk samples before decode
 - `KVCoreConfig` is the primary runtime configuration entrypoint; legacy model/engine configs are converted at the engine boundary
 - `ModelRunner` injects paged KV metadata through a forward context instead of passing it through every model layer
 - `torch_paged` is the slow correctness reference for paged KV semantics

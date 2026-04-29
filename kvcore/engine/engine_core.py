@@ -24,6 +24,10 @@ class EngineConfig:
     num_gpu_blocks: int | None = 2048
     max_num_seqs: int = 8
     max_num_scheduled_tokens: int = 512
+    max_num_partial_prefills: int = 1
+    max_long_partial_prefills: int = 1
+    long_prefill_token_threshold: int = 0
+    reserve_full_prompt_blocks: bool = False
     max_model_len: int | None = None
     profile_kv_cache: bool = False
     gpu_memory_utilization: float = 0.9
@@ -38,6 +42,14 @@ class EngineConfig:
                 "gpu_memory_utilization must be in (0, 1], "
                 f"got {self.gpu_memory_utilization}"
             )
+        SchedulerConfig(
+            max_num_seqs=self.max_num_seqs,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            max_long_partial_prefills=self.max_long_partial_prefills,
+            long_prefill_token_threshold=self.long_prefill_token_threshold,
+            reserve_full_prompt_blocks=self.reserve_full_prompt_blocks,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +125,7 @@ class EngineCore:
         request = self.scheduler.abort_request(request_id)
         if request is None:
             return
+        self.model_runner.remove_requests([request_id])
         self.finished_outputs[request_id] = FinishedRequestOutput(
             request_id=request_id,
             output_token_ids=request.output_token_ids,
@@ -129,7 +142,6 @@ class EngineCore:
 
         model_step_output = self.model_runner.execute_model(
             scheduler_output=scheduler_output,
-            kv_manager=self.scheduler.kv_manager,
         )
         sampled_token_map = dict(
             zip(
@@ -149,6 +161,9 @@ class EngineCore:
                 output_token_ids=finished_request.output_token_ids,
                 finish_reason=finished_request.finish_reason,
             )
+        self.model_runner.remove_requests(
+            [finished_request.request_id for finished_request in update_result.finished_requests]
+        )
         return EngineCoreOutputs(request_outputs=update_result.step_outputs)
 
     def take_finished_output(self, request_id: str) -> FinishedRequestOutput | None:
@@ -246,6 +261,10 @@ class EngineCore:
             scheduler=SchedulerConfig(
                 max_num_seqs=legacy_engine_config.max_num_seqs,
                 max_num_scheduled_tokens=legacy_engine_config.max_num_scheduled_tokens,
+                max_num_partial_prefills=legacy_engine_config.max_num_partial_prefills,
+                max_long_partial_prefills=legacy_engine_config.max_long_partial_prefills,
+                long_prefill_token_threshold=legacy_engine_config.long_prefill_token_threshold,
+                reserve_full_prompt_blocks=legacy_engine_config.reserve_full_prompt_blocks,
             ),
         )
 
