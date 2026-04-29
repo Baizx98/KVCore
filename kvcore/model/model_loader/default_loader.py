@@ -350,11 +350,11 @@ class HuggingFaceModelLoader(DefaultModelLoader):
 
 
 def _resolve_model_dtype(hf_config: PretrainedConfig) -> torch.dtype | None:
-    torch_dtype = getattr(hf_config, "torch_dtype", None)
-    if isinstance(torch_dtype, torch.dtype):
-        return torch_dtype
-    if isinstance(torch_dtype, str):
-        return getattr(torch, torch_dtype, None)
+    dtype = getattr(hf_config, "dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        return getattr(torch, dtype, None)
     return None
 
 
