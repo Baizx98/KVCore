@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
-from safetensors.torch import load_file as load_safetensors_file
+from safetensors import safe_open
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
@@ -22,6 +22,9 @@ from kvcore.model.models import (
     MistralForCausalLM,
     Qwen3ForCausalLM,
 )
+from kvcore.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "llama": Llama3ForCausalLM,
@@ -100,6 +103,12 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_path: Path) -> set[str]:
         loaded_params = self._load_model_weights(model, self.get_all_weights(model_path, model))
         self._validate_loaded_weights(model, loaded_params)
+        if self.counter_before_loading_weights and self.counter_after_loading_weights:
+            logger.info(
+                "Model weights loaded params=%d elapsed=%.3fs",
+                len(loaded_params),
+                self.counter_after_loading_weights - self.counter_before_loading_weights,
+            )
         return loaded_params
 
     def get_all_weights(
@@ -136,14 +145,65 @@ class DefaultModelLoader(BaseModelLoader):
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
 
+        tensor_device = self._resolve_weight_tensor_device()
         for filename in weight_files:
             filepath = model_path / filename
             if filepath.suffix == ".safetensors":
-                state_dict = load_safetensors_file(str(filepath), device="cpu")
-            else:
-                state_dict = torch.load(filepath, map_location="cpu", weights_only=True)
-            for name, tensor in state_dict.items():
-                yield source.prefix + name, tensor
+                yield from self._iter_safetensors_file(filepath, source.prefix, tensor_device)
+                continue
+
+            state_dict = torch.load(filepath, map_location="cpu", weights_only=True)
+            yield from ((source.prefix + name, tensor) for name, tensor in state_dict.items())
+
+    def _resolve_weight_tensor_device(self) -> str:
+        device = self.load_config.device
+        if device is None:
+            return "cpu"
+        torch_device = torch.device(device)
+        if torch_device.type != "cuda":
+            return "cpu"
+        if not torch.cuda.is_available():
+            return "cpu"
+        return str(torch_device)
+
+    def _iter_safetensors_file(
+        self,
+        filepath: Path,
+        prefix: str,
+        device: str,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        try:
+            yield from self._iter_safetensors_file_on_device(filepath, prefix, device)
+        except RuntimeError as exc:
+            if device == "cpu" or not self._is_cuda_memory_error(exc):
+                raise
+            logger.warning(
+                "Falling back to CPU weight loading after CUDA allocation failure "
+                "file=%s error=%s",
+                filepath.name,
+                exc,
+            )
+            torch.cuda.empty_cache()
+            yield from self._iter_safetensors_file_on_device(filepath, prefix, "cpu")
+
+    @staticmethod
+    def _iter_safetensors_file_on_device(
+        filepath: Path,
+        prefix: str,
+        device: str,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        with safe_open(filepath, framework="pt", device=device) as weights_file:
+            for name in weights_file.keys():
+                yield prefix + name, weights_file.get_tensor(name)
+
+    @staticmethod
+    def _is_cuda_memory_error(exc: RuntimeError) -> bool:
+        message = str(exc).lower()
+        return "cuda" in message and (
+            "out of memory" in message
+            or "allocation" in message
+            or "cublas" in message
+        )
 
     def _prepare_weights(
         self,

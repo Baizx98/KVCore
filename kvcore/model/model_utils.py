@@ -64,13 +64,13 @@ def load_named_weights(
 
         if name in params:
             param = params[name]
-            param.data.copy_(loaded_weight.to(device=param.device, dtype=param.dtype))
+            _copy_weight_into_tensor(loaded_weight, param.data)
             loaded_params.add(name)
             continue
 
         if name in buffers:
             buffer = buffers[name]
-            buffer.data.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+            _copy_weight_into_tensor(loaded_weight, buffer.data)
             loaded_params.add(name)
 
     return loaded_params
@@ -90,11 +90,27 @@ def _load_stacked_weight(
         if stacked_name not in params:
             return None
         param = params[stacked_name]
-        loaded_weight = loaded_weight.to(device=param.device, dtype=param.dtype)
+        loaded_weight = _prepare_weight_for_tensor(loaded_weight, param.data)
         offset = _stacked_weight_offset(param, loaded_weight, shard_id)
         param.data.narrow(0, offset, loaded_weight.shape[0]).copy_(loaded_weight)
         return stacked_name
     return None
+
+
+def _copy_weight_into_tensor(loaded_weight: torch.Tensor, target: torch.Tensor) -> None:
+    if loaded_weight.device == target.device and loaded_weight.dtype == target.dtype:
+        target.copy_(loaded_weight)
+        return
+    target.copy_(loaded_weight.to(device=target.device, dtype=target.dtype))
+
+
+def _prepare_weight_for_tensor(
+    loaded_weight: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    if loaded_weight.device == target.device and loaded_weight.dtype == target.dtype:
+        return loaded_weight
+    return loaded_weight.to(device=target.device, dtype=target.dtype)
 
 
 def _stacked_weight_offset(
