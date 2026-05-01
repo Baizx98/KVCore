@@ -8,7 +8,7 @@ from kvcore.sched.utils import SchedulerConfig
 if TYPE_CHECKING:
     from transformers.configuration_utils import PretrainedConfig
 
-    from kvcore.model.model_loader import ModelLoadConfig
+    from kvcore.model.model_loader.base_loader import LoadConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,21 +19,21 @@ class ModelConfig:
     local_files_only: bool = False
     load_format: str = "auto"
     download_dir: str | None = None
-    ignore_patterns: tuple[str, ...] = ()
+    ignore_patterns: list[str] = field(default_factory=list)
     attn_backend: str | None = None
     device: str | None = None
     hf_config: PretrainedConfig | None = None
 
     @classmethod
-    def from_load_config(cls, load_config: ModelLoadConfig) -> ModelConfig:
+    def from_load_config(cls, load_config: LoadConfig) -> ModelConfig:
         return cls(
-            model=load_config.model,
+            model=str(load_config.model),
             revision=load_config.revision,
             trust_remote_code=load_config.trust_remote_code,
             local_files_only=load_config.local_files_only,
             load_format=load_config.load_format,
             download_dir=load_config.download_dir,
-            ignore_patterns=tuple(load_config.ignore_patterns),
+            ignore_patterns=list(load_config.ignore_patterns),
             attn_backend=load_config.attn_backend,
             device=load_config.device,
         )
@@ -42,10 +42,10 @@ class ModelConfig:
         config = replace(self, hf_config=hf_config)
         return config
 
-    def to_load_config(self) -> ModelLoadConfig:
-        from kvcore.model.model_loader import ModelLoadConfig
+    def to_load_config(self) -> LoadConfig:
+        from kvcore.model.model_loader.base_loader import LoadConfig
 
-        return ModelLoadConfig(
+        return LoadConfig(
             model=self.model,
             revision=self.revision,
             trust_remote_code=self.trust_remote_code,

@@ -13,7 +13,8 @@ from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.model.forward_context import ForwardContext, set_forward_context
 from kvcore.model.kv_runtime import PagedAttentionMetadata
-from kvcore.model.model_loader import DefaultModelLoader, ModelLoadConfig
+from kvcore.model.model_loader import DefaultModelLoader
+from kvcore.model.model_loader.base_loader import LoadConfig
 from kvcore.sample import Sampler
 from kvcore.sched.utils import SchedulerOutput
 from kvcore.utils.log import get_logger
@@ -228,7 +229,7 @@ class InputBatch:
 class ModelRunner:
     """Owns model creation, weight loading, and single-step execution."""
 
-    def __init__(self, load_config: ModelLoadConfig | ModelConfig | KVCoreConfig) -> None:
+    def __init__(self, load_config: LoadConfig | ModelConfig | KVCoreConfig) -> None:
         self.load_config = self._normalize_load_config(load_config)
         self.model_loader = DefaultModelLoader(self.load_config)
         self.hf_config: PretrainedConfig | None = None
@@ -244,12 +245,6 @@ class ModelRunner:
             self.load_config.device,
             self.load_config.attn_backend,
         )
-
-    def create_model(self) -> nn.Module:
-        logger.info("Creating model model=%s", self.load_config.model)
-        self.hf_config = self.model_loader.load_config_from_source()
-        self.model = self.model_loader.create_model(self.hf_config)
-        return self.model
 
     def load_model(self) -> nn.Module:
         logger.info("Loading model model=%s", self.load_config.model)
@@ -721,8 +716,8 @@ class ModelRunner:
 
     @staticmethod
     def _normalize_load_config(
-        load_config: ModelLoadConfig | ModelConfig | KVCoreConfig,
-    ) -> ModelLoadConfig:
+        load_config: LoadConfig | ModelConfig | KVCoreConfig,
+    ) -> LoadConfig:
         if isinstance(load_config, KVCoreConfig):
             return load_config.model.to_load_config()
         if isinstance(load_config, ModelConfig):

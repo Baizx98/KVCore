@@ -9,7 +9,7 @@ import torch
 from kvcore.config import KVCoreConfig, ModelConfig, RuntimeConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
-from kvcore.model.model_loader import ModelLoadConfig
+from kvcore.model.model_loader.base_loader import LoadConfig
 from kvcore.model.model_runner import KVCacheProfileResult, ModelRunner
 from kvcore.sched.scheduler import Scheduler
 from kvcore.sched.utils import RequestStepOutput, SchedulerConfig
@@ -72,12 +72,10 @@ class FinishedRequestOutput:
 class EngineCore:
     def __init__(
         self,
-        load_config: ModelLoadConfig | KVCoreConfig | None = None,
+        load_config: LoadConfig | KVCoreConfig | None = None,
         engine_config: EngineConfig | None = None,
         *,
         config: KVCoreConfig | None = None,
-        model_runner: ModelRunner | None = None,
-        tokenizer_manager: TokenizerManager | None = None,
     ) -> None:
         self.config = self._normalize_config(
             config=config,
@@ -95,10 +93,10 @@ class EngineCore:
         )
         self.load_config = load_config
         self.engine_config = self.config.runtime
-        self.model_runner = model_runner or ModelRunner(load_config)
+        self.model_runner = ModelRunner(load_config)
         if self.model_runner.model is None:
             self.model_runner.load_model()
-        self.tokenizer_manager = tokenizer_manager or TokenizerManager.from_model_source(
+        self.tokenizer_manager = TokenizerManager.from_model_source(
             model=load_config.model,
             revision=load_config.revision,
             trust_remote_code=load_config.trust_remote_code,
@@ -263,7 +261,7 @@ class EngineCore:
         cls,
         *,
         config: KVCoreConfig | None,
-        load_config: ModelLoadConfig | KVCoreConfig | None,
+        load_config: LoadConfig | KVCoreConfig | None,
         engine_config: EngineConfig | None,
     ) -> KVCoreConfig:
         if isinstance(load_config, KVCoreConfig):
