@@ -30,7 +30,6 @@ class EngineConfig:
     max_num_partial_prefills: int = 1
     max_long_partial_prefills: int = 1
     long_prefill_token_threshold: int = 0
-    reserve_full_prompt_blocks: bool = False
     max_model_len: int | None = None
     profile_kv_cache: bool = False
     gpu_memory_utilization: float = 0.9
@@ -51,7 +50,6 @@ class EngineConfig:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
-            reserve_full_prompt_blocks=self.reserve_full_prompt_blocks,
         )
 
 
@@ -145,19 +143,6 @@ class EngineCore:
             sampling_params.max_tokens,
         )
 
-    def abort_request(self, request_id: str) -> None:
-        request = self.scheduler.abort_request(request_id)
-        if request is None:
-            logger.warning("Abort ignored for unknown request_id=%s", request_id)
-            return
-        self.model_runner.remove_requests([request_id])
-        self.finished_outputs[request_id] = FinishedRequestOutput(
-            request_id=request_id,
-            output_token_ids=request.output_token_ids,
-            finish_reason=request.get_finished_reason(),
-        )
-        logger.info("Aborted request request_id=%s", request_id)
-
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests()
 
@@ -167,23 +152,23 @@ class EngineCore:
             logger.debug("Engine step skipped: scheduler output is empty")
             return EngineCoreOutputs.empty()
         logger.debug(
-            "Engine step scheduled reqs=%d tokens=%d prefill=%d decode=%d",
-            len(scheduler_output.scheduled_requests),
+            "Engine step scheduled reqs=%d tokens=%d",
+            len(scheduler_output.num_scheduled_tokens),
             scheduler_output.total_num_scheduled_tokens,
-            scheduler_output.num_prefill_reqs,
-            scheduler_output.num_decode_reqs,
         )
 
         model_step_output = self.model_runner.execute_model(
             scheduler_output=scheduler_output,
         )
-        sampled_token_map = dict(
-            zip(
-                model_step_output.sampled_request_ids,
+        sampled_token_map = {
+            req_id: token_ids[0]
+            for req_id, token_ids in zip(
+                model_step_output.req_ids,
                 model_step_output.sampled_token_ids,
                 strict=True,
             )
-        )
+            if token_ids
+        }
         update_result = self.scheduler.update_from_outputs(
             scheduler_output,
             sampled_token_map,
@@ -201,7 +186,7 @@ class EngineCore:
         logger.info(
             "Engine step completed outputs=%d sampled=%d finished=%d",
             len(update_result.step_outputs),
-            len(model_step_output.sampled_request_ids),
+            len(sampled_token_map),
             len(update_result.finished_requests),
         )
         return EngineCoreOutputs(request_outputs=update_result.step_outputs)
@@ -311,7 +296,6 @@ class EngineCore:
                 max_num_partial_prefills=legacy_engine_config.max_num_partial_prefills,
                 max_long_partial_prefills=legacy_engine_config.max_long_partial_prefills,
                 long_prefill_token_threshold=legacy_engine_config.long_prefill_token_threshold,
-                reserve_full_prompt_blocks=legacy_engine_config.reserve_full_prompt_blocks,
             ),
         )
 

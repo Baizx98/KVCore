@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import fnmatch
 import json
+import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors_file
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
@@ -34,6 +37,7 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
 
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 PT_WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
+DEFAULT_WEIGHT_LOAD_THREADS = 4
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -94,9 +98,9 @@ class DefaultModelLoader(BaseModelLoader):
     def load_model(self) -> nn.Module:
         hf_config = self.load_config_from_source()
         model = self.create_model(hf_config)
+        self.load_weights(model, self.resolve_model_path())
         if self.load_config.device is not None:
             model = model.to(self.load_config.device)
-        self.load_weights(model, self.resolve_model_path())
         model.eval()
         return model
 
@@ -123,11 +127,11 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, model)
 
         secondary_weights = getattr(model, "secondary_weights", ())
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, model)
 
     def download_model(self) -> Path:
         return self.resolve_model_path()
@@ -135,6 +139,7 @@ class DefaultModelLoader(BaseModelLoader):
     def _get_weights_iterator(
         self,
         source: Source,
+        model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         model_path, weight_files = self._prepare_weights(
             source.model_or_path,
@@ -145,7 +150,16 @@ class DefaultModelLoader(BaseModelLoader):
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
 
-        tensor_device = self._resolve_weight_tensor_device()
+        tensor_device = self._resolve_weight_tensor_device(model)
+        if self._should_use_multithread_load(weight_files):
+            filepaths = [model_path / filename for filename in weight_files]
+            if all(filepath.suffix == ".safetensors" for filepath in filepaths):
+                yield from self._iter_safetensors_files_multithread(filepaths, source.prefix)
+                return
+            if all(filepath.suffix != ".safetensors" for filepath in filepaths):
+                yield from self._iter_pt_files_multithread(filepaths, source.prefix)
+                return
+
         for filename in weight_files:
             filepath = model_path / filename
             if filepath.suffix == ".safetensors":
@@ -155,9 +169,15 @@ class DefaultModelLoader(BaseModelLoader):
             state_dict = torch.load(filepath, map_location="cpu", weights_only=True)
             yield from ((source.prefix + name, tensor) for name, tensor in state_dict.items())
 
-    def _resolve_weight_tensor_device(self) -> str:
+    def _resolve_weight_tensor_device(self, model: nn.Module) -> str:
         device = self.load_config.device
         if device is None:
+            return "cpu"
+        try:
+            current_device = next(model.parameters()).device
+        except StopIteration:
+            return "cpu"
+        if current_device.type == "cpu":
             return "cpu"
         torch_device = torch.device(device)
         if torch_device.type != "cuda":
@@ -165,6 +185,29 @@ class DefaultModelLoader(BaseModelLoader):
         if not torch.cuda.is_available():
             return "cpu"
         return str(torch_device)
+
+    def _should_use_multithread_load(self, weight_files: list[str]) -> bool:
+        if len(weight_files) <= 1:
+            return False
+        disabled = os.environ.get("KVCORE_DISABLE_MULTITHREAD_WEIGHT_LOAD")
+        if disabled is not None and disabled.lower() in {"1", "true", "yes"}:
+            return False
+        return self._num_weight_load_threads() > 1
+
+    @staticmethod
+    def _num_weight_load_threads() -> int:
+        raw_value = os.environ.get("KVCORE_WEIGHT_LOAD_THREADS")
+        if raw_value is None:
+            return DEFAULT_WEIGHT_LOAD_THREADS
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid KVCORE_WEIGHT_LOAD_THREADS=%r; using %d",
+                raw_value,
+                DEFAULT_WEIGHT_LOAD_THREADS,
+            )
+            return DEFAULT_WEIGHT_LOAD_THREADS
 
     def _iter_safetensors_file(
         self,
@@ -185,6 +228,75 @@ class DefaultModelLoader(BaseModelLoader):
             )
             torch.cuda.empty_cache()
             yield from self._iter_safetensors_file_on_device(filepath, prefix, "cpu")
+
+    def _iter_safetensors_files_multithread(
+        self,
+        filepaths: list[Path],
+        prefix: str,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        logger.info(
+            "Loading safetensors shards with multithread CPU loader files=%d threads=%d",
+            len(filepaths),
+            self._num_weight_load_threads(),
+        )
+        for state_dict in self._iter_loaded_state_dicts(
+            filepaths,
+            loader=lambda filepath: load_safetensors_file(str(filepath), device="cpu"),
+        ):
+            for name in list(state_dict):
+                yield prefix + name, state_dict.pop(name)
+            del state_dict
+
+    def _iter_pt_files_multithread(
+        self,
+        filepaths: list[Path],
+        prefix: str,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        logger.info(
+            "Loading PyTorch checkpoint shards with multithread CPU loader files=%d threads=%d",
+            len(filepaths),
+            self._num_weight_load_threads(),
+        )
+        for state_dict in self._iter_loaded_state_dicts(
+            filepaths,
+            loader=lambda filepath: torch.load(
+                filepath,
+                map_location="cpu",
+                weights_only=True,
+            ),
+        ):
+            for name in list(state_dict):
+                yield prefix + name, state_dict.pop(name)
+            del state_dict
+
+    def _iter_loaded_state_dicts(
+        self,
+        filepaths: list[Path],
+        *,
+        loader: Callable[[Path], dict[str, torch.Tensor]],
+    ) -> Generator[dict[str, torch.Tensor], None, None]:
+        max_workers = min(self._num_weight_load_threads(), len(filepaths))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            pending = {
+                executor.submit(loader, filepath): filepath
+                for filepath in filepaths[:max_workers]
+            }
+            next_file_index = max_workers
+            while pending:
+                done, _pending = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    filepath = pending.pop(future)
+                    try:
+                        yield future.result()
+                    except Exception as exc:
+                        raise RuntimeError(f"Failed to load weight shard: {filepath}") from exc
+                    if next_file_index < len(filepaths):
+                        next_path = filepaths[next_file_index]
+                        pending[executor.submit(loader, next_path)] = next_path
+                        next_file_index += 1
 
     @staticmethod
     def _iter_safetensors_file_on_device(

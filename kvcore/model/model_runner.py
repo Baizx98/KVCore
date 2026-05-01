@@ -34,12 +34,13 @@ class KVCacheProfileResult:
 
 @dataclass(frozen=True, slots=True)
 class ModelStepOutput:
-    sampled_request_ids: tuple[str, ...]
-    sampled_token_ids: tuple[int, ...]
+    req_ids: tuple[str, ...]
+    sampled_token_ids: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ModelRunnerPreparedInput:
+    request_ids: tuple[str, ...]
     input_ids: torch.Tensor
     positions: torch.Tensor
     query_start_loc: torch.Tensor
@@ -50,16 +51,33 @@ class ModelRunnerPreparedInput:
     sample_indices: tuple[int, ...]
     sampled_request_ids: tuple[str, ...]
     sampling_params: tuple[SamplingParams, ...]
-    num_reqs: int
-    num_scheduled_tokens: int
     num_prefill_reqs: int
     num_decode_reqs: int
-    max_query_len: int
-    max_seq_len: int
+
+    @property
+    def num_reqs(self) -> int:
+        return len(self.request_ids)
+
+    @property
+    def num_scheduled_tokens(self) -> int:
+        return int(self.input_ids.numel())
+
+    @property
+    def max_query_len(self) -> int:
+        if not self.query_lens.numel():
+            return 0
+        return int(self.query_lens.max().item())
+
+    @property
+    def max_seq_len(self) -> int:
+        if not self.seq_lens.numel():
+            return 0
+        return int(self.seq_lens.max().item())
 
 
 @dataclass(frozen=True, slots=True)
 class ModelRunnerInput:
+    request_ids: tuple[str, ...]
     input_ids: torch.Tensor
     positions: torch.Tensor
     attn_metadata: PagedAttentionMetadata
@@ -88,6 +106,22 @@ class ModelRunnerRequestState:
     sampling_params: SamplingParams
     block_ids: tuple[tuple[int, ...], ...]
     num_computed_tokens: int = 0
+    num_prompt_tokens: int = 0
+    output_token_ids: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.num_prompt_tokens == 0:
+            self.num_prompt_tokens = len(self.token_ids)
+        if self.output_token_ids is None:
+            self.output_token_ids = []
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def num_output_tokens(self) -> int:
+        return len(self.output_token_ids or ())
 
 
 class InputBatch:
@@ -99,6 +133,7 @@ class InputBatch:
         self.requests: list[ModelRunnerRequestState | None] = []
 
     def update_from_scheduler_output(self, scheduler_output: SchedulerOutput) -> None:
+        self.remove_requests(tuple(scheduler_output.finished_req_ids))
         for new_request in scheduler_output.scheduled_new_reqs:
             self.add_request(
                 ModelRunnerRequestState(
@@ -107,6 +142,8 @@ class InputBatch:
                     sampling_params=new_request.sampling_params,
                     block_ids=new_request.block_ids,
                     num_computed_tokens=new_request.num_computed_tokens,
+                    num_prompt_tokens=len(new_request.prompt_token_ids),
+                    output_token_ids=[],
                 )
             )
             logger.debug(
@@ -123,6 +160,9 @@ class InputBatch:
                 state.token_ids.extend(new_token_ids)
             state.block_ids = cached_requests.block_ids[req_index]
             state.num_computed_tokens = num_computed_tokens
+            state.output_token_ids = state.output_token_ids[
+                : cached_requests.num_output_tokens[req_index]
+            ]
             logger.debug(
                 "InputBatch updated cached request req_id=%s new_tokens=%d "
                 "num_computed_tokens=%d",
@@ -168,6 +208,9 @@ class InputBatch:
         for req_id, token_id in zip(req_ids, token_ids, strict=True):
             state = self.get_request(req_id)
             state.token_ids.append(token_id)
+            if state.output_token_ids is None:
+                state.output_token_ids = []
+            state.output_token_ids.append(token_id)
         if req_ids:
             logger.debug("InputBatch recorded sampled tokens count=%d", len(req_ids))
 
@@ -310,39 +353,48 @@ class ModelRunner:
         sample_indices: list[int] = []
         sampled_request_ids: list[str] = []
         sampling_params: list[SamplingParams] = []
-        for scheduled_request in scheduler_output.scheduled_requests:
-            request_state = self.input_batch.get_request(scheduled_request.request_id)
-            start = scheduled_request.num_computed_tokens
-            end = start + scheduled_request.num_scheduled_tokens
+        request_ids = tuple(scheduler_output.num_scheduled_tokens)
+        num_prefill_reqs = 0
+        num_decode_reqs = 0
+        for request_id, num_scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
+            request_state = self.input_batch.get_request(request_id)
+            start = request_state.num_computed_tokens
+            end = start + num_scheduled_tokens
+            if end > len(request_state.token_ids):
+                raise ValueError(
+                    "Scheduler requested tokens that are not present in InputBatch: "
+                    f"req_id={request_id} start={start} end={end} "
+                    f"available={len(request_state.token_ids)}"
+                )
             flat_input_token_ids.extend(request_state.token_ids[start:end])
             flat_positions.extend(range(start, end))
             request_idx = len(query_lens)
-            query_start_loc.append(query_start_loc[-1] + scheduled_request.query_len)
-            seq_lens.append(scheduled_request.context_len + scheduled_request.query_len)
-            context_lens.append(scheduled_request.context_len)
-            query_lens.append(scheduled_request.query_len)
-            token_request_indices.extend([request_idx] * scheduled_request.query_len)
-            if scheduled_request.should_sample:
-                if scheduled_request.sample_index is None:
-                    raise ValueError(
-                        "Scheduled request marked for sampling must provide sample_index: "
-                        f"{scheduled_request.request_id}"
-                    )
-                sample_indices.append(scheduled_request.sample_index)
-                sampled_request_ids.append(scheduled_request.request_id)
+            query_start_loc.append(query_start_loc[-1] + num_scheduled_tokens)
+            seq_lens.append(end)
+            context_lens.append(start)
+            query_lens.append(num_scheduled_tokens)
+            token_request_indices.extend([request_idx] * num_scheduled_tokens)
+            if start < request_state.num_prompt_tokens:
+                num_prefill_reqs += 1
+            else:
+                num_decode_reqs += 1
+            if end >= request_state.num_tokens:
+                sample_indices.append(query_start_loc[-1] - 1)
+                sampled_request_ids.append(request_id)
                 sampling_params.append(request_state.sampling_params)
         input_ids = torch.tensor(flat_input_token_ids, dtype=torch.long, device=device)
         positions = torch.tensor(flat_positions, dtype=torch.long, device=device)
         logger.debug(
             "Prepared model input reqs=%d tokens=%d samples=%d max_query_len=%d "
             "max_seq_len=%d",
-            len(scheduler_output.scheduled_requests),
+            len(request_ids),
             scheduler_output.total_num_scheduled_tokens,
             len(sample_indices),
             max(query_lens, default=0),
             max(seq_lens, default=0),
         )
         return ModelRunnerPreparedInput(
+            request_ids=request_ids,
             input_ids=input_ids,
             positions=positions,
             query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32, device=device),
@@ -357,12 +409,8 @@ class ModelRunner:
             sample_indices=tuple(sample_indices),
             sampled_request_ids=tuple(sampled_request_ids),
             sampling_params=tuple(sampling_params),
-            num_reqs=len(scheduler_output.scheduled_requests),
-            num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
-            num_prefill_reqs=scheduler_output.num_prefill_reqs,
-            num_decode_reqs=scheduler_output.num_decode_reqs,
-            max_query_len=max(query_lens, default=0),
-            max_seq_len=max(seq_lens, default=0),
+            num_prefill_reqs=num_prefill_reqs,
+            num_decode_reqs=num_decode_reqs,
         )
 
     def build_attention_metadata(
@@ -373,7 +421,7 @@ class ModelRunner:
         prepared_input = prepared_input or self._prepare_runtime_input(scheduler_output)
         kv_cache_tensor = self._require_kv_cache_tensor()
         kv_manager_config = self._require_kv_manager_config()
-        num_reqs = len(scheduler_output.scheduled_requests)
+        num_reqs = prepared_input.num_reqs
         device = self._resolve_device()
 
         block_tables = MultiGroupBlockTable(
@@ -386,8 +434,8 @@ class ModelRunner:
             kernel_block_sizes=[spec.block_size for spec in kv_manager_config.layer_specs],
         )
 
-        for request_idx, scheduled_request in enumerate(scheduler_output.scheduled_requests):
-            block_ids = self.input_batch.get_request(scheduled_request.request_id).block_ids
+        for request_idx, request_id in enumerate(prepared_input.request_ids):
+            block_ids = self.input_batch.get_request(request_id).block_ids
             block_tables.add_row(block_ids, request_idx)
 
         block_tables.commit_block_table(num_reqs)
@@ -421,8 +469,8 @@ class ModelRunner:
             token_request_indices=prepared_input.token_request_indices,
             num_reqs=num_reqs,
             num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
-            num_prefill_reqs=scheduler_output.num_prefill_reqs,
-            num_decode_reqs=scheduler_output.num_decode_reqs,
+            num_prefill_reqs=prepared_input.num_prefill_reqs,
+            num_decode_reqs=prepared_input.num_decode_reqs,
             max_query_len=prepared_input.max_query_len,
             max_seq_len=prepared_input.max_seq_len,
         )
@@ -441,6 +489,7 @@ class ModelRunner:
         attn_metadata: PagedAttentionMetadata,
     ) -> ModelRunnerInput:
         return ModelRunnerInput(
+            request_ids=prepared_input.request_ids,
             input_ids=prepared_input.input_ids,
             positions=prepared_input.positions,
             attn_metadata=attn_metadata,
@@ -463,7 +512,10 @@ class ModelRunner:
         if scheduler_output.total_num_scheduled_tokens == 0:
             self.last_step_stats = ModelRunnerStepStats(0, 0, 0, 0, 0, 0, 0, 0, 0)
             logger.debug("ModelRunner skipped zero-token scheduler output")
-            return ModelStepOutput((), ())
+            return ModelStepOutput(
+                tuple(self.input_batch.req_ids),
+                (),
+            )
 
         num_zeroed_blocks = self._zero_new_blocks(scheduler_output.new_block_ids_to_zero)
         prepare_start = perf_counter()
@@ -498,7 +550,7 @@ class ModelRunner:
             prepared_input.num_scheduled_tokens,
             prepared_input.num_prefill_reqs,
             prepared_input.num_decode_reqs,
-            len(output.sampled_request_ids),
+            sum(1 for token_ids in output.sampled_token_ids if token_ids),
             num_zeroed_blocks,
             prepare_time,
             metadata_time,
@@ -539,9 +591,13 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         model_input: ModelRunnerInput,
     ) -> ModelStepOutput:
+        req_ids = model_input.request_ids
         if not model_input.sample_indices:
             logger.debug("Sampling skipped: no sample indices")
-            return ModelStepOutput((), ())
+            return ModelStepOutput(
+                req_ids=req_ids,
+                sampled_token_ids=tuple(() for _ in req_ids),
+            )
 
         sample_index_tensor = torch.tensor(
             model_input.sample_indices,
@@ -562,9 +618,15 @@ class ModelRunner:
             model_input.sampled_request_ids,
             sampled_token_ids_tuple,
         )
+        sampled_by_req_id = dict(
+            zip(model_input.sampled_request_ids, sampled_token_ids_tuple, strict=True)
+        )
         return ModelStepOutput(
-            sampled_request_ids=model_input.sampled_request_ids,
-            sampled_token_ids=sampled_token_ids_tuple,
+            req_ids=req_ids,
+            sampled_token_ids=tuple(
+                (sampled_by_req_id[req_id],) if req_id in sampled_by_req_id else ()
+                for req_id in req_ids
+            ),
         )
 
     def _estimate_num_gpu_blocks(

@@ -225,10 +225,6 @@ class KVManager:
             for manager in self.layer_managers
         )
 
-        if self.enable_caching:
-            num_tokens_to_cache = min(num_tokens_need_slot, request.num_tokens)
-            self.cache_blocks(request, num_tokens_to_cache)
-
         allocated = self.create_kv_cache_blocks(new_blocks)
         logger.debug(
             "KV allocated request_id=%s num_new_tokens=%d num_tokens_need_slot=%d "

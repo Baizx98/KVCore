@@ -217,32 +217,42 @@ def debug_step(core: EngineCore, step_index: int) -> EngineCoreOutputs:
     print(
         "scheduler_output: "
         f"total_tokens={scheduler_output.total_num_scheduled_tokens} "
-        f"prefill_reqs={scheduler_output.num_prefill_reqs} "
-        f"decode_reqs={scheduler_output.num_decode_reqs} "
         f"new_reqs={[req.req_id for req in scheduler_output.scheduled_new_reqs]} "
         f"cached_reqs={list(scheduler_output.scheduled_cached_reqs.req_ids)} "
         f"zero_blocks={scheduler_output.new_block_ids_to_zero}"
     )
-    for scheduled_request in scheduler_output.scheduled_requests:
-        layer0_blocks = scheduled_request.block_ids[0] if scheduled_request.block_ids else ()
+    for new_request in scheduler_output.scheduled_new_reqs:
+        layer0_blocks = new_request.block_ids[0] if new_request.block_ids else ()
         print(
-            f"  scheduled {scheduled_request.request_id}: "
-            f"prefill={scheduled_request.is_prefill} "
-            f"context={scheduled_request.context_len} "
-            f"query={scheduled_request.query_len} "
-            f"sample={scheduled_request.should_sample} "
-            f"sample_index={scheduled_request.sample_index} "
+            f"  new {new_request.req_id}: "
+            f"prompt_tokens={len(new_request.prompt_token_ids)} "
+            f"computed={new_request.num_computed_tokens} "
+            f"scheduled={scheduler_output.num_scheduled_tokens[new_request.req_id]} "
+            f"layer0_blocks={layer0_blocks}"
+        )
+    cached_reqs = scheduler_output.scheduled_cached_reqs
+    for req_index, req_id in enumerate(cached_reqs.req_ids):
+        block_ids = cached_reqs.block_ids[req_index]
+        layer0_blocks = block_ids[0] if block_ids else ()
+        print(
+            f"  cached {req_id}: "
+            f"new_tokens={list(cached_reqs.new_token_ids[req_index])} "
+            f"computed={cached_reqs.num_computed_tokens[req_index]} "
+            f"output_tokens={cached_reqs.num_output_tokens[req_index]} "
+            f"scheduled={scheduler_output.num_scheduled_tokens[req_id]} "
             f"layer0_blocks={layer0_blocks}"
         )
 
     model_step_output = core.model_runner.execute_model(scheduler_output)
-    sampled_token_map = dict(
-        zip(
-            model_step_output.sampled_request_ids,
+    sampled_token_map = {
+        request_id: token_ids[0]
+        for request_id, token_ids in zip(
+            model_step_output.req_ids,
             model_step_output.sampled_token_ids,
             strict=True,
         )
-    )
+        if token_ids
+    }
     sampled_text = {
         request_id: core.tokenizer_manager.decode((token_id,))
         for request_id, token_id in sampled_token_map.items()

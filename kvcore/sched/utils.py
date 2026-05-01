@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from kvcore.utils.request import FinishReason
 from kvcore.utils.sampling_params import SamplingParams
@@ -13,7 +13,6 @@ class SchedulerConfig:
     max_num_partial_prefills: int = 1
     max_long_partial_prefills: int = 1
     long_prefill_token_threshold: int = 0
-    reserve_full_prompt_blocks: bool = False
 
     def __post_init__(self) -> None:
         if self.max_num_seqs <= 0:
@@ -43,32 +42,12 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduledRequest:
-    request_id: str
-    is_prefill: bool
-    context_len: int
-    query_len: int
-    sample_index: int | None
-    should_sample: bool
-    num_computed_tokens: int = 0
-    block_ids: tuple[tuple[int, ...], ...] = ()
-
-    @property
-    def num_scheduled_tokens(self) -> int:
-        return self.query_len
-
-
-@dataclass(frozen=True, slots=True)
 class NewRequestData:
     req_id: str
     prompt_token_ids: tuple[int, ...]
     sampling_params: SamplingParams
     block_ids: tuple[tuple[int, ...], ...]
     num_computed_tokens: int
-    num_scheduled_tokens: int
-    is_prefill: bool
-    should_sample: bool
-    sample_index: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +56,7 @@ class CachedRequestData:
     new_token_ids: tuple[tuple[int, ...], ...]
     block_ids: tuple[tuple[tuple[int, ...], ...], ...]
     num_computed_tokens: tuple[int, ...]
-    num_scheduled_tokens: tuple[int, ...]
-    is_prefill: tuple[bool, ...]
-    should_sample: tuple[bool, ...]
-    sample_indices: tuple[int | None, ...]
+    num_output_tokens: tuple[int, ...]
 
     @classmethod
     def empty(cls) -> CachedRequestData:
@@ -89,43 +65,43 @@ class CachedRequestData:
             new_token_ids=(),
             block_ids=(),
             num_computed_tokens=(),
-            num_scheduled_tokens=(),
-            is_prefill=(),
-            should_sample=(),
-            sample_indices=(),
+            num_output_tokens=(),
         )
 
     @property
     def num_reqs(self) -> int:
         return len(self.req_ids)
 
+    def is_context_phase(self, req_id: str) -> bool:
+        try:
+            req_index = self.req_ids.index(req_id)
+        except ValueError:
+            return False
+        return self.num_output_tokens[req_index] == 0
+
 
 @dataclass(frozen=True, slots=True)
 class SchedulerOutput:
-    scheduled_requests: tuple[ScheduledRequest, ...]
+    scheduled_new_reqs: tuple[NewRequestData, ...]
+    scheduled_cached_reqs: CachedRequestData
     num_scheduled_tokens: dict[str, int]
     total_num_scheduled_tokens: int
-    num_prefill_reqs: int
-    num_decode_reqs: int
+    finished_req_ids: frozenset[str] = frozenset()
     new_block_ids_to_zero: tuple[int, ...] = ()
-    scheduled_new_reqs: tuple[NewRequestData, ...] = ()
-    scheduled_cached_reqs: CachedRequestData = field(default_factory=CachedRequestData.empty)
 
     @property
     def is_empty(self) -> bool:
-        return self.total_num_scheduled_tokens == 0
+        return self.total_num_scheduled_tokens == 0 and not self.finished_req_ids
 
     @classmethod
     def empty(cls) -> SchedulerOutput:
         return cls(
-            scheduled_requests=(),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
-            num_prefill_reqs=0,
-            num_decode_reqs=0,
-            new_block_ids_to_zero=(),
             scheduled_new_reqs=(),
             scheduled_cached_reqs=CachedRequestData.empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            finished_req_ids=frozenset(),
+            new_block_ids_to_zero=(),
         )
 
 
@@ -155,7 +131,6 @@ __all__ = [
     "FinishedRequestState",
     "CachedRequestData",
     "NewRequestData",
-    "ScheduledRequest",
     "SchedulerConfig",
     "SchedulerOutput",
     "SchedulerUpdateResult",

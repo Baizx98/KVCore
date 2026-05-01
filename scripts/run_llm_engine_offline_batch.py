@@ -139,7 +139,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-partial-prefills", type=int, default=2)
     parser.add_argument("--max-long-partial-prefills", type=int, default=2)
     parser.add_argument("--long-prefill-token-threshold", type=int, default=0)
-    parser.add_argument("--reserve-full-prompt-blocks", action="store_true")
     parser.add_argument("--log-level", default="DEBUG")
     parser.add_argument(
         "--log-file",
@@ -217,7 +216,6 @@ def build_config(args: argparse.Namespace) -> KVCoreConfig:
             max_num_partial_prefills=args.max_num_partial_prefills,
             max_long_partial_prefills=args.max_long_partial_prefills,
             long_prefill_token_threshold=args.long_prefill_token_threshold,
-            reserve_full_prompt_blocks=args.reserve_full_prompt_blocks,
         ),
     )
 

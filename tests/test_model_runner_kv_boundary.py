@@ -12,8 +12,8 @@ from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.sched.scheduler import Scheduler
 from kvcore.sched.utils import (
+    CachedRequestData,
     NewRequestData,
-    ScheduledRequest,
     SchedulerConfig,
     SchedulerOutput,
 )
@@ -103,23 +103,6 @@ class SpyCausalLM(nn.Module):
 
 def make_manual_scheduler_output() -> SchedulerOutput:
     return SchedulerOutput(
-        scheduled_requests=(
-            ScheduledRequest(
-                request_id="req",
-                is_prefill=True,
-                context_len=0,
-                query_len=2,
-                sample_index=1,
-                should_sample=True,
-                num_computed_tokens=0,
-                block_ids=((1,), (1,)),
-            ),
-        ),
-        num_scheduled_tokens={"req": 2},
-        total_num_scheduled_tokens=2,
-        num_prefill_reqs=1,
-        num_decode_reqs=0,
-        new_block_ids_to_zero=(1,),
         scheduled_new_reqs=(
             NewRequestData(
                 req_id="req",
@@ -127,12 +110,12 @@ def make_manual_scheduler_output() -> SchedulerOutput:
                 sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
                 block_ids=((1,), (1,)),
                 num_computed_tokens=0,
-                num_scheduled_tokens=2,
-                is_prefill=True,
-                should_sample=True,
-                sample_index=1,
             ),
         ),
+        scheduled_cached_reqs=CachedRequestData.empty(),
+        num_scheduled_tokens={"req": 2},
+        total_num_scheduled_tokens=2,
+        new_block_ids_to_zero=(1,),
     )
 
 
@@ -235,8 +218,8 @@ def test_model_runner_execute_model_uses_forward_context_not_model_kwargs() -> N
     assert len(spy_model.calls) == 1
     assert spy_model.calls[0]["input_ids"].tolist() == [7, 8]
     assert spy_model.calls[0]["positions"].tolist() == [0, 1]
-    assert step_output.sampled_request_ids == ("req",)
-    assert step_output.sampled_token_ids == (5,)
+    assert step_output.req_ids == ("req",)
+    assert step_output.sampled_token_ids == ((5,),)
     assert runner.last_step_stats is not None
     assert runner.last_step_stats.num_reqs == 1
     assert runner.last_step_stats.num_scheduled_tokens == 2
@@ -257,5 +240,6 @@ def test_model_runner_execute_model_samples_requested_positions() -> None:
     scheduler_output = scheduler.schedule()
     step_output = runner.execute_model(scheduler_output)
 
-    assert step_output.sampled_request_ids == ("req",)
+    assert step_output.req_ids == ("req",)
     assert len(step_output.sampled_token_ids) == 1
+    assert len(step_output.sampled_token_ids[0]) == 1

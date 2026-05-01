@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
@@ -97,6 +98,26 @@ def _write_pretrained_dir(
     return root
 
 
+def _write_sharded_safetensors_dir(root: Path, config, model) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    config.save_pretrained(root)
+    state_items = list(model.state_dict().items())
+    split_at = len(state_items) // 2
+    shards = {
+        "model-00001-of-00002.safetensors": dict(state_items[:split_at]),
+        "model-00002-of-00002.safetensors": dict(state_items[split_at:]),
+    }
+    weight_map: dict[str, str] = {}
+    for shard_name, shard_state in shards.items():
+        save_safetensors_file(shard_state, str(root / shard_name))
+        weight_map.update({name: shard_name for name in shard_state})
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map}),
+        encoding="utf-8",
+    )
+    return root
+
+
 def test_hf_loader_creates_llama_model_from_local_config(tmp_path: Path) -> None:
     config = _make_tiny_llama_config()
     model_dir = tmp_path / "llama_local"
@@ -151,6 +172,32 @@ def test_hf_loader_loads_safetensors_weights(tmp_path: Path) -> None:
         ModelLoadConfig(
             model=str(model_dir),
             local_files_only=True,
+        )
+    )
+    loaded_model = loader.load_model()
+
+    assert isinstance(loaded_model, Qwen3ForCausalLM)
+    _assert_same_state_dict(reference_model, loaded_model)
+
+
+def test_default_loader_loads_sharded_safetensors_with_multithread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    torch.manual_seed(0)
+    reference_model = Qwen3ForCausalLM(_make_kvcore_config(_make_tiny_qwen3_config()))
+    model_dir = _write_sharded_safetensors_dir(
+        tmp_path / "qwen3_sharded_safe",
+        reference_model.config,
+        reference_model,
+    )
+    monkeypatch.setenv("KVCORE_WEIGHT_LOAD_THREADS", "2")
+
+    loader = DefaultModelLoader(
+        ModelLoadConfig(
+            model=str(model_dir),
+            local_files_only=True,
+            load_format="safetensors",
         )
     )
     loaded_model = loader.load_model()
