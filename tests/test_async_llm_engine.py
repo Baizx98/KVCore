@@ -5,10 +5,9 @@ import asyncio
 import torch
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from kvcore.config import KVCoreConfig, ModelConfig
-from kvcore.engine.engine_core import EngineConfig
+from kvcore.config import CacheConfig, DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
+from kvcore.engine import engine_core as engine_core_module
 from kvcore.entry.async_llm_engine import AsyncLLMEngine
-from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.utils.sampling_params import SamplingParams
@@ -30,9 +29,17 @@ class FakeTokenizerManager:
         return set()
 
 
-def make_tiny_model_runner() -> ModelRunner:
-    load_config = ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged")
-    runner = ModelRunner(load_config)
+def make_config() -> KVCoreConfig:
+    return KVCoreConfig(
+        model_config=ModelConfig(model="unused", attn_backend="torch_paged", max_model_len=32),
+        cache_config=CacheConfig(block_size=2, num_gpu_blocks=32),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=8),
+        device_config=DeviceConfig(device="cpu"),
+    )
+
+
+def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
+    runner = ModelRunner(config)
     hf_config = LlamaConfig(
         vocab_size=64,
         hidden_size=32,
@@ -45,34 +52,38 @@ def make_tiny_model_runner() -> ModelRunner:
     )
     runner.model = Llama3ForCausalLM(
         KVCoreConfig(
-            model=ModelConfig(
+            model_config=ModelConfig(
                 model="unused",
-                device="cpu",
                 attn_backend="torch_paged",
                 hf_config=hf_config,
-            )
+            ),
+            device_config=DeviceConfig(device="cpu"),
         )
     )
     return runner
 
 
 def make_async_engine() -> AsyncLLMEngine:
-    return AsyncLLMEngine(
-        load_config=ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged"),
-        engine_config=EngineConfig(
-            block_size=2,
-            num_gpu_blocks=32,
-            max_num_seqs=2,
-            max_num_scheduled_tokens=8,
-            max_model_len=32,
-        ),
-        model_runner=make_tiny_model_runner(),
-        tokenizer_manager=FakeTokenizerManager(),
+    config = make_config()
+    return AsyncLLMEngine(config=config)
+
+
+def install_fake_engine_dependencies(monkeypatch, config: KVCoreConfig) -> None:
+    monkeypatch.setattr(
+        engine_core_module,
+        "ModelRunner",
+        lambda _config: make_tiny_model_runner(config),
+    )
+    monkeypatch.setattr(
+        engine_core_module.TokenizerManager,
+        "from_model_source",
+        lambda **_kwargs: FakeTokenizerManager(),
     )
 
 
-def test_async_llm_engine_generate_offline_batch() -> None:
+def test_async_llm_engine_generate_offline_batch(monkeypatch) -> None:
     async def run() -> None:
+        install_fake_engine_dependencies(monkeypatch, make_config())
         engine = make_async_engine()
         outputs = await engine.generate(
             [
@@ -94,8 +105,9 @@ def test_async_llm_engine_generate_offline_batch() -> None:
     asyncio.run(run())
 
 
-def test_async_llm_engine_submit_simulated_online_requests() -> None:
+def test_async_llm_engine_submit_simulated_online_requests(monkeypatch) -> None:
     async def run() -> None:
+        install_fake_engine_dependencies(monkeypatch, make_config())
         engine = make_async_engine()
         first = await engine.submit(
             "req-1",
@@ -116,9 +128,11 @@ def test_async_llm_engine_submit_simulated_online_requests() -> None:
     asyncio.run(run())
 
 
-def test_async_llm_engine_run_until_idle_with_no_requests() -> None:
+def test_async_llm_engine_run_until_idle_with_no_requests(monkeypatch) -> None:
     async def run() -> None:
+        install_fake_engine_dependencies(monkeypatch, make_config())
         engine = make_async_engine()
         await engine.run_until_idle()
+        assert not engine.engine_core.has_unfinished_requests()
 
     asyncio.run(run())

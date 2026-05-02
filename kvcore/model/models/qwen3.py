@@ -189,7 +189,7 @@ class Qwen3Model(nn.Module):
                 Qwen3DecoderLayer(
                     config=config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx}"),
-                    attn_backend=kvcore_config.model.attn_backend,
+                    attn_backend=kvcore_config.model_config.attn_backend,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from kvcore.config import KVCoreConfig
 from kvcore.kv.compression import (
     KVCompressionConfig,
     KVCompressionResult,
@@ -18,7 +19,6 @@ from kvcore.sched.utils import (
     FinishedRequestState,
     NewRequestData,
     RequestStepOutput,
-    SchedulerConfig,
     SchedulerOutput,
     SchedulerUpdateResult,
 )
@@ -50,13 +50,14 @@ class Scheduler(SchedulerInterface):
 
     def __init__(
         self,
+        config: KVCoreConfig,
         kv_manager_config: KVManagerConfig,
-        scheduler_config: SchedulerConfig | None = None,
         *,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
+        self.config = config
         self.metrics_collector = metrics_collector
-        self.scheduler_config = scheduler_config or SchedulerConfig()
+        self.scheduler_config = config.scheduler_config
         self.kv_manager: KVManager = KVManager(
             kv_manager_config,
             metrics_collector=self.metrics_collector,

@@ -5,9 +5,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from kvcore.config import KVCoreConfig
-from kvcore.engine.engine_core import EngineConfig, EngineCore
+from kvcore.engine.engine_core import EngineCore
 from kvcore.entry.llm_engine import GenerationOutput, GenerationRequest, LLMEngine
-from kvcore.model.model_loader.base_loader import LoadConfig
 from kvcore.utils.log import get_logger
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -19,19 +18,10 @@ class AsyncLLMEngine:
 
     def __init__(
         self,
-        load_config: LoadConfig | KVCoreConfig | None = None,
-        engine_config: EngineConfig | None = None,
-        *,
-        config: KVCoreConfig | None = None,
-        **core_kwargs,
+        config: KVCoreConfig,
     ) -> None:
         logger.info("Initializing AsyncLLMEngine")
-        self.engine_core = EngineCore(
-            load_config=load_config,
-            engine_config=engine_config,
-            config=config,
-            **core_kwargs,
-        )
+        self.engine_core = EngineCore(config=config)
         self._pending_queue: asyncio.Queue[GenerationRequest] = asyncio.Queue()
         self._futures: dict[str, asyncio.Future[GenerationOutput]] = {}
 

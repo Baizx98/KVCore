@@ -65,9 +65,9 @@ def make_tiny_mistral_config(**overrides) -> MistralConfig:
 
 def make_kvcore_config(hf_config, *, attn_backend=None) -> KVCoreConfig:
     config = KVCoreConfig(
-        model=ModelConfig(
+        model_config=ModelConfig(
             model="unused",
-            attn_backend=attn_backend,
+            attn_backend=attn_backend or "torch_paged",
             hf_config=hf_config,
         )
     )

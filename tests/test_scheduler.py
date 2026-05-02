@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from kvcore.config import KVCoreConfig, ModelConfig, SchedulerConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.kv_metrics import KVCacheMetricsCollector
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.sched.scheduler import Scheduler
-from kvcore.sched.utils import SchedulerConfig
 from kvcore.utils.request import Request, RequestStatus
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -27,6 +27,13 @@ def make_kv_config() -> KVManagerConfig:
     )
 
 
+def make_config(scheduler_config: SchedulerConfig | None = None) -> KVCoreConfig:
+    return KVCoreConfig(
+        model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+        scheduler_config=scheduler_config or SchedulerConfig(),
+    )
+
+
 def make_request(request_id: str, token_ids: list[int], max_tokens: int = 2) -> Request:
     return Request(
         request_id=request_id,
@@ -36,7 +43,7 @@ def make_request(request_id: str, token_ids: list[int], max_tokens: int = 2) -> 
 
 
 def test_scheduler_initializes_and_owns_kv_manager() -> None:
-    scheduler = Scheduler(make_kv_config())
+    scheduler = Scheduler(make_config(), make_kv_config())
 
     assert scheduler.kv_manager.config.num_gpu_blocks == 16
     assert scheduler.kv_manager.num_layers == 1
@@ -44,19 +51,21 @@ def test_scheduler_initializes_and_owns_kv_manager() -> None:
 
 def test_scheduler_passes_metrics_collector_to_kv_manager() -> None:
     metrics_collector = KVCacheMetricsCollector(sample_rate=1.0)
-    scheduler = Scheduler(make_kv_config(), metrics_collector=metrics_collector)
+    scheduler = Scheduler(make_config(), make_kv_config(), metrics_collector=metrics_collector)
 
     assert scheduler.kv_manager.block_pool.metrics_collector is metrics_collector
 
 
 def test_scheduler_chunked_prefill_emits_new_request_data() -> None:
     scheduler = Scheduler(
-        make_kv_config(),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=2,
-            max_num_scheduled_tokens=4,
-            max_num_partial_prefills=2,
+        make_config(
+            SchedulerConfig(
+                max_num_seqs=2,
+                max_num_scheduled_tokens=4,
+                max_num_partial_prefills=2,
+            )
         ),
+        make_kv_config(),
     )
     request = make_request("req", [1, 2, 3, 4, 5, 6], max_tokens=1)
     scheduler.add_request(request)
@@ -74,8 +83,8 @@ def test_scheduler_chunked_prefill_emits_new_request_data() -> None:
 
 def test_scheduler_chunked_prefill_continuation_samples_on_last_chunk() -> None:
     scheduler = Scheduler(
+        make_config(SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4)),
         make_kv_config(),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4),
     )
     request = make_request("req", [1, 2, 3, 4, 5, 6], max_tokens=2)
     scheduler.add_request(request)
@@ -100,12 +109,14 @@ def test_scheduler_chunked_prefill_continuation_samples_on_last_chunk() -> None:
 
 def test_scheduler_limits_partial_prefill_continuations() -> None:
     scheduler = Scheduler(
-        make_kv_config(),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=2,
-            max_num_scheduled_tokens=4,
-            max_num_partial_prefills=1,
+        make_config(
+            SchedulerConfig(
+                max_num_seqs=2,
+                max_num_scheduled_tokens=4,
+                max_num_partial_prefills=1,
+            )
         ),
+        make_kv_config(),
     )
     scheduler.add_request(make_request("req-1", [1, 2, 3, 4, 5, 6], max_tokens=1))
     scheduler.add_request(make_request("req-2", [7, 8, 9, 10, 11, 12], max_tokens=1))
@@ -117,12 +128,14 @@ def test_scheduler_limits_partial_prefill_continuations() -> None:
 
 def test_scheduler_does_not_reuse_prefix_blocks_within_same_step() -> None:
     scheduler = Scheduler(
-        make_kv_config(),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=2,
-            max_num_scheduled_tokens=8,
-            max_num_partial_prefills=2,
+        make_config(
+            SchedulerConfig(
+                max_num_seqs=2,
+                max_num_scheduled_tokens=8,
+                max_num_partial_prefills=2,
+            )
         ),
+        make_kv_config(),
     )
     scheduler.add_request(make_request("req-1", [1, 2, 3, 4], max_tokens=1))
     scheduler.add_request(make_request("req-2", [1, 2, 5, 6], max_tokens=1))
@@ -134,12 +147,14 @@ def test_scheduler_does_not_reuse_prefix_blocks_within_same_step() -> None:
 
 def test_scheduler_prioritizes_running_requests_before_waiting_fcfs() -> None:
     scheduler = Scheduler(
-        make_kv_config(),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=2,
-            max_num_scheduled_tokens=4,
-            max_num_partial_prefills=2,
+        make_config(
+            SchedulerConfig(
+                max_num_seqs=2,
+                max_num_scheduled_tokens=4,
+                max_num_partial_prefills=2,
+            )
         ),
+        make_kv_config(),
     )
     scheduler.add_request(make_request("running", [1, 2, 3, 4, 5, 6], max_tokens=1))
     first = scheduler.schedule()
@@ -155,8 +170,8 @@ def test_scheduler_prioritizes_running_requests_before_waiting_fcfs() -> None:
 
 def test_scheduler_decode_progression_and_finish() -> None:
     scheduler = Scheduler(
+        make_config(SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=4)),
         make_kv_config(),
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=4),
     )
     request = make_request("req", [1, 2, 3, 4], max_tokens=2)
     scheduler.add_request(request)
@@ -178,8 +193,8 @@ def test_scheduler_decode_progression_and_finish() -> None:
 
 def test_scheduler_finish_requests_clears_waiting_and_running() -> None:
     scheduler = Scheduler(
+        make_config(SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=2)),
         make_kv_config(),
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=2),
     )
     scheduler.add_request(make_request("running", [1, 2, 3, 4], max_tokens=1))
     scheduler.add_request(make_request("waiting", [5, 6], max_tokens=1))

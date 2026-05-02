@@ -5,8 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kvcore.config import KVCoreConfig
-from kvcore.engine.engine_core import EngineConfig, EngineCore
-from kvcore.model.model_loader.base_loader import LoadConfig
+from kvcore.engine.engine_core import EngineCore
 from kvcore.utils.log import get_logger
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -31,19 +30,10 @@ class GenerationOutput:
 class LLMEngine:
     def __init__(
         self,
-        load_config: LoadConfig | KVCoreConfig | None = None,
-        engine_config: EngineConfig | None = None,
-        *,
-        config: KVCoreConfig | None = None,
-        **core_kwargs,
+        config: KVCoreConfig,
     ) -> None:
         logger.info("Initializing LLMEngine")
-        self.engine_core = EngineCore(
-            load_config=load_config,
-            engine_config=engine_config,
-            config=config,
-            **core_kwargs,
-        )
+        self.engine_core = EngineCore(config=config)
 
     def add_request(
         self,

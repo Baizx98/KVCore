@@ -5,9 +5,15 @@ from pathlib import Path
 import pytest
 import torch
 
-from kvcore.engine.engine_core import EngineConfig
+from kvcore.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVCoreConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+)
 from kvcore.entry.llm_engine import LLMEngine
-from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.utils.sampling_params import SamplingParams
 
 LIVE_MODEL_PATH = Path("/Tan/model/Llama-3.1-8B-Instruct")
@@ -19,17 +25,12 @@ LIVE_MODEL_PATH = Path("/Tan/model/Llama-3.1-8B-Instruct")
 )
 def test_llm_engine_live_llama31_generation() -> None:
     engine = LLMEngine(
-        load_config=ModelLoadConfig(
-            model=str(LIVE_MODEL_PATH),
-            device="cuda",
-            local_files_only=True,
-        ),
-        engine_config=EngineConfig(
-            block_size=16,
-            num_gpu_blocks=256,
-            max_num_seqs=2,
-            max_num_scheduled_tokens=128,
-            max_model_len=512,
+        config=KVCoreConfig(
+            model_config=ModelConfig(model=str(LIVE_MODEL_PATH), max_model_len=512),
+            load_config=LoadConfig(local_files_only=True),
+            cache_config=CacheConfig(block_size=16, num_gpu_blocks=256),
+            scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=128),
+            device_config=DeviceConfig(device="cuda"),
         ),
     )
 
@@ -52,6 +53,7 @@ def test_llm_engine_live_llama31_generation() -> None:
     assert outputs[0].request_id == "live-req"
     assert len(outputs[0].output_token_ids) == 1
     assert outputs[0].finish_reason == "length"
+
 
 if __name__ == "__main__":
     test_llm_engine_live_llama31_generation()

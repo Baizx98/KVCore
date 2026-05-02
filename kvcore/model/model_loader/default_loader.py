@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Callable, Iterable, cast
+from typing import cast
 
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 
-from kvcore.config import KVCoreConfig, ModelConfig
+from kvcore.config import KVCoreConfig
 from kvcore.model.models import (
     Llama3ForCausalLM,
     MistralForCausalLM,
@@ -17,7 +18,7 @@ from kvcore.model.models import (
 )
 from kvcore.utils.log import get_logger
 
-from .base_loader import BaseModelLoader, LoadConfig
+from .base_loader import BaseModelLoader
 from .utils import resolve_model_dtype, resolve_weight_tensor_device, set_default_torch_dtype
 from .weight_utils import (
     filter_duplicate_safetensors_files,
@@ -46,16 +47,17 @@ class DefaultModelLoader(BaseModelLoader):
         loaded_weights = self.load_weights(model)
         if self.load_config.strict:
             self._validate_loaded_weights(model, loaded_weights)
-        if self.load_config.device is not None:
-            model = model.to(self.load_config.device)
+        if self.device_config.device is not None:
+            model = model.to(self.device_config.device)
         model.eval()
         return model
 
     def _load_config(self) -> PretrainedConfig:
         return AutoConfig.from_pretrained(
-            self.load_config.model,
+            self.model_config.model,
             revision=self.load_config.revision,
-            trust_remote_code=self.load_config.trust_remote_code,
+            cache_dir=self.load_config.download_dir,
+            trust_remote_code=self.model_config.trust_remote_code,
             local_files_only=self.load_config.local_files_only,
         )
 
@@ -63,24 +65,22 @@ class DefaultModelLoader(BaseModelLoader):
         model_cls = MODEL_REGISTRY.get(hf_config.model_type)
         if model_cls is None:
             raise ValueError(
-                f"Unsupported model_type: {hf_config.model_type!r}. Supported: {sorted(MODEL_REGISTRY)}"
+                f"Unsupported model_type: {hf_config.model_type!r}. "
+                f"Supported: {sorted(MODEL_REGISTRY)}"
             )
 
-        dtype = self.load_config.dtype or resolve_model_dtype(hf_config)
+        dtype = self.model_config.dtype or resolve_model_dtype(hf_config)
         with set_default_torch_dtype(dtype):
-            model_config = ModelConfig(
-                model=str(self.load_config.model),
-                revision=self.load_config.revision,
-                trust_remote_code=self.load_config.trust_remote_code,
-                local_files_only=self.load_config.local_files_only,
-                load_format=self.load_config.load_format,
-                download_dir=self.load_config.download_dir,
-                ignore_patterns=list(self.load_config.ignore_patterns),
-                attn_backend=self.load_config.attn_backend,
-                device=self.load_config.device,
-                hf_config=hf_config,
+            model_config = self.model_config.with_hf_config(hf_config)
+            return model_cls(
+                kvcore_config=KVCoreConfig(
+                    model_config=model_config,
+                    load_config=self.load_config,
+                    cache_config=self.config.cache_config,
+                    scheduler_config=self.config.scheduler_config,
+                    device_config=self.device_config,
+                )
             )
-            return model_cls(kvcore_config=KVCoreConfig(model=model_config))
 
     def load_weights(self, model: nn.Module) -> set[str]:
         load_weights = getattr(model, "load_weights", None)
@@ -96,9 +96,9 @@ class DefaultModelLoader(BaseModelLoader):
         return load_weights(self._get_weights_iterator(weight_files))
 
     def _resolve_model_path(self) -> Path:
-        model_path = Path(self.load_config.model)
+        model_path = Path(self.model_config.model)
         if not model_path.exists():
-            raise FileNotFoundError(f"Model path does not exist: {self.load_config.model}")
+            raise FileNotFoundError(f"Model path does not exist: {self.model_config.model}")
         return model_path.resolve()
 
     def _prepare_weights(self, model_path: Path) -> list[Path]:
@@ -171,7 +171,7 @@ class DefaultModelLoader(BaseModelLoader):
         if not weight_files:
             return iter(())
 
-        tensor_device = resolve_weight_tensor_device(self.load_config.device)
+        tensor_device = resolve_weight_tensor_device(self.device_config.device)
         if all(path.suffix == ".safetensors" for path in weight_files):
             return safetensors_weights_iterator(weight_files, device=tensor_device)
         return pt_weights_iterator(weight_files, device=tensor_device)
@@ -196,12 +196,12 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
-    return DefaultModelLoader(load_config)
+def get_model_loader(config: KVCoreConfig) -> BaseModelLoader:
+    return DefaultModelLoader(config)
 
 
-def get_model(load_config: LoadConfig) -> nn.Module:
-    return get_model_loader(load_config).load_model()
+def get_model(config: KVCoreConfig) -> nn.Module:
+    return get_model_loader(config).load_model()
 
 
-__all__ = ["DefaultModelLoader", "get_model_loader", "get_model", "MODEL_REGISTRY", "LoadConfig"]
+__all__ = ["DefaultModelLoader", "get_model_loader", "get_model", "MODEL_REGISTRY"]

@@ -7,41 +7,6 @@ from kvcore.utils.sampling_params import SamplingParams
 
 
 @dataclass(frozen=True, slots=True)
-class SchedulerConfig:
-    max_num_seqs: int = 8
-    max_num_scheduled_tokens: int = 512
-    max_num_partial_prefills: int = 1
-    max_long_partial_prefills: int = 1
-    long_prefill_token_threshold: int = 0
-
-    def __post_init__(self) -> None:
-        if self.max_num_seqs <= 0:
-            raise ValueError(
-                f"max_num_seqs must be positive, got {self.max_num_seqs}"
-            )
-        if self.max_num_scheduled_tokens <= 0:
-            raise ValueError(
-                "max_num_scheduled_tokens must be positive, "
-                f"got {self.max_num_scheduled_tokens}"
-            )
-        if self.max_num_partial_prefills <= 0:
-            raise ValueError(
-                "max_num_partial_prefills must be positive, "
-                f"got {self.max_num_partial_prefills}"
-            )
-        if self.max_long_partial_prefills <= 0:
-            raise ValueError(
-                "max_long_partial_prefills must be positive, "
-                f"got {self.max_long_partial_prefills}"
-            )
-        if self.long_prefill_token_threshold < 0:
-            raise ValueError(
-                "long_prefill_token_threshold must be non-negative, "
-                f"got {self.long_prefill_token_threshold}"
-            )
-
-
-@dataclass(frozen=True, slots=True)
 class NewRequestData:
     req_id: str
     prompt_token_ids: tuple[int, ...]
@@ -131,7 +96,6 @@ __all__ = [
     "FinishedRequestState",
     "CachedRequestData",
     "NewRequestData",
-    "SchedulerConfig",
     "SchedulerOutput",
     "SchedulerUpdateResult",
 ]

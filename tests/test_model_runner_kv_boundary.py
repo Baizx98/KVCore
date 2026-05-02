@@ -4,17 +4,15 @@ import torch
 from torch import nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from kvcore.config import KVCoreConfig, ModelConfig
+from kvcore.config import DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
-from kvcore.model.model_loader import ModelLoadConfig
 from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.sched.scheduler import Scheduler
 from kvcore.sched.utils import (
     CachedRequestData,
     NewRequestData,
-    SchedulerConfig,
     SchedulerOutput,
 )
 from kvcore.utils.request import Request
@@ -22,7 +20,7 @@ from kvcore.utils.sampling_params import SamplingParams
 
 
 def make_runner_with_tiny_model() -> ModelRunner:
-    runner = ModelRunner(ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged"))
+    runner = ModelRunner(make_runner_config())
     hf_config = LlamaConfig(
         vocab_size=64,
         hidden_size=32,
@@ -35,14 +33,22 @@ def make_runner_with_tiny_model() -> ModelRunner:
     )
     runner.model = Llama3ForCausalLM(
         KVCoreConfig(
-            model=ModelConfig(
+            model_config=ModelConfig(
                 model="unused",
                 attn_backend="torch_paged",
                 hf_config=hf_config,
-            )
+            ),
+            device_config=DeviceConfig(device="cpu"),
         )
     )
     return runner
+
+
+def make_runner_config() -> KVCoreConfig:
+    return KVCoreConfig(
+        model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+        device_config=DeviceConfig(device="cpu"),
+    )
 
 
 def make_kv_config(num_layers: int = 2) -> KVManagerConfig:
@@ -134,8 +140,12 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
     kv_config = make_kv_config()
     runner.initialize_kv_cache(kv_config)
     scheduler = Scheduler(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=4),
+            device_config=DeviceConfig(device="cpu"),
+        ),
         kv_config,
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_scheduled_tokens=4),
     )
 
     scheduler.add_request(make_request())
@@ -175,8 +185,12 @@ def test_model_runner_batch_tracks_chunked_prefill_and_decode_tokens() -> None:
     kv_config = make_kv_config()
     runner.initialize_kv_cache(kv_config)
     scheduler = Scheduler(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4),
+            device_config=DeviceConfig(device="cpu"),
+        ),
         kv_config,
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4),
     )
     scheduler.add_request(make_request(token_ids=[1, 2, 3, 4, 5, 6], max_tokens=2))
 
@@ -205,7 +219,7 @@ def test_model_runner_batch_tracks_chunked_prefill_and_decode_tokens() -> None:
 
 
 def test_model_runner_execute_model_uses_forward_context_not_model_kwargs() -> None:
-    runner = ModelRunner(ModelLoadConfig(model="unused", device="cpu", attn_backend="torch_paged"))
+    runner = ModelRunner(make_runner_config())
     spy_model = SpyCausalLM()
     runner.model = spy_model
     kv_config = make_kv_config(num_layers=1)
@@ -232,8 +246,12 @@ def test_model_runner_execute_model_samples_requested_positions() -> None:
     kv_config = make_kv_config()
     runner.initialize_kv_cache(kv_config)
     scheduler = Scheduler(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=8),
+            device_config=DeviceConfig(device="cpu"),
+        ),
         kv_config,
-        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=8),
     )
 
     scheduler.add_request(make_request(token_ids=[1, 2, 3, 4]))

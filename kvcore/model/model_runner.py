@@ -7,14 +7,13 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from kvcore.config import KVCoreConfig, ModelConfig
+from kvcore.config import KVCoreConfig
 from kvcore.kv.block_table import MultiGroupBlockTable
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.model.forward_context import ForwardContext, set_forward_context
 from kvcore.model.kv_runtime import PagedAttentionMetadata
 from kvcore.model.model_loader import DefaultModelLoader
-from kvcore.model.model_loader.base_loader import LoadConfig
 from kvcore.sample import Sampler
 from kvcore.sched.utils import SchedulerOutput
 from kvcore.utils.log import get_logger
@@ -229,10 +228,9 @@ class InputBatch:
 class ModelRunner:
     """Owns model creation, weight loading, and single-step execution."""
 
-    def __init__(self, load_config: LoadConfig | ModelConfig | KVCoreConfig) -> None:
-        self.load_config = self._normalize_load_config(load_config)
-        self.model_loader = DefaultModelLoader(self.load_config)
-        self.hf_config: PretrainedConfig | None = None
+    def __init__(self, config: KVCoreConfig) -> None:
+        self.config = config
+        self.model_loader = DefaultModelLoader(config)
         self.model: nn.Module | None = None
         self.kv_manager_config: KVManagerConfig | None = None
         self.kv_cache_tensor: torch.Tensor | None = None
@@ -241,16 +239,15 @@ class ModelRunner:
         self.last_step_stats: ModelRunnerStepStats | None = None
         logger.info(
             "ModelRunner initialized model=%s device=%s attn_backend=%s",
-            self.load_config.model,
-            self.load_config.device,
-            self.load_config.attn_backend,
+            self.config.model_config.model,
+            self.config.device_config.device,
+            self.config.model_config.attn_backend,
         )
 
     def load_model(self) -> nn.Module:
-        logger.info("Loading model model=%s", self.load_config.model)
+        logger.info("Loading model model=%s", self.config.model_config.model)
         self.model = self.model_loader.load_model()
-        self.hf_config = getattr(self.model, "config", None)
-        logger.info("Model loaded model=%s", self.load_config.model)
+        logger.info("Model loaded model=%s", self.config.model_config.model)
         return self.model
 
     def profile_run(
@@ -687,7 +684,7 @@ class ModelRunner:
 
     def _require_model(self) -> nn.Module:
         if self.model is None:
-            raise RuntimeError("Model is not initialized. Call create_model/load_model first.")
+            raise RuntimeError("Model is not initialized. Call load_model first.")
         return self.model
 
     def _require_kv_cache_tensor(self) -> torch.Tensor:
@@ -705,24 +702,14 @@ class ModelRunner:
         return self.kv_manager_config
 
     def _resolve_device(self) -> torch.device:
-        if self.load_config.device is not None:
-            return torch.device(self.load_config.device)
+        if self.config.device_config.device is not None:
+            return torch.device(self.config.device_config.device)
         if self.model is not None:
             try:
                 return next(self.model.parameters()).device
             except StopIteration:
                 pass
         return torch.device("cpu")
-
-    @staticmethod
-    def _normalize_load_config(
-        load_config: LoadConfig | ModelConfig | KVCoreConfig,
-    ) -> LoadConfig:
-        if isinstance(load_config, KVCoreConfig):
-            return load_config.model.to_load_config()
-        if isinstance(load_config, ModelConfig):
-            return load_config.to_load_config()
-        return load_config
 
 
 __all__ = [

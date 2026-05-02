@@ -28,9 +28,9 @@ def extract_layer_index(prefix: str) -> int:
 
 
 def get_hf_config(kvcore_config: KVCoreConfig) -> PretrainedConfig:
-    hf_config = kvcore_config.model.hf_config
+    hf_config = kvcore_config.model_config.hf_config
     if hf_config is None:
-        raise ValueError("KVCoreConfig.model.hf_config must be set before model creation")
+        raise ValueError("KVCoreConfig.model_config.hf_config must be set before model creation")
     return hf_config
 
 

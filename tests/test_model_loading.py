@@ -7,12 +7,8 @@ import torch
 from safetensors.torch import save_file as save_safetensors_file
 from transformers import LlamaConfig, MistralConfig, Qwen3Config
 
-from kvcore.config import KVCoreConfig, ModelConfig
-from kvcore.model.model_loader import (
-    DefaultModelLoader,
-    HuggingFaceModelLoader,
-    ModelLoadConfig,
-)
+from kvcore.config import DeviceConfig, KVCoreConfig, LoadConfig, ModelConfig
+from kvcore.model.model_loader import DefaultModelLoader
 from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.model.models.mistral import MistralForCausalLM
@@ -64,13 +60,29 @@ def _make_tiny_mistral_config() -> MistralConfig:
 
 def _make_kvcore_config(config, *, attn_backend: str | None = None) -> KVCoreConfig:
     kvcore_config = KVCoreConfig(
-        model=ModelConfig(
+        model_config=ModelConfig(
             model="unused",
-            attn_backend=attn_backend,
+            attn_backend=attn_backend or "torch_paged",
             hf_config=config,
         )
     )
     return kvcore_config
+
+
+def _make_loader_config(
+    model_dir: Path,
+    *,
+    load_format: str = "auto",
+    device: str | None = None,
+) -> KVCoreConfig:
+    return KVCoreConfig(
+        model_config=ModelConfig(model=str(model_dir)),
+        load_config=LoadConfig(
+            local_files_only=True,
+            load_format=load_format,
+        ),
+        device_config=DeviceConfig(device=device),
+    )
 
 
 def _assert_same_state_dict(model_a, model_b) -> None:
@@ -123,15 +135,10 @@ def test_hf_loader_creates_llama_model_from_local_config(tmp_path: Path) -> None
     model_dir = tmp_path / "llama_local"
     config.save_pretrained(model_dir)
 
-    loader = HuggingFaceModelLoader(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-        )
-    )
+    loader = DefaultModelLoader(_make_loader_config(model_dir))
 
-    hf_config = loader.load_config_from_source()
-    model = loader.create_model(hf_config)
+    hf_config = loader._load_config()
+    model = loader._initialize_model(hf_config)
 
     assert isinstance(model, Llama3ForCausalLM)
 
@@ -146,12 +153,7 @@ def test_hf_loader_loads_pytorch_bin_weights(tmp_path: Path) -> None:
         use_safetensors=False,
     )
 
-    loader = HuggingFaceModelLoader(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-        )
-    )
+    loader = DefaultModelLoader(_make_loader_config(model_dir))
     loaded_model = loader.load_model()
 
     assert isinstance(loaded_model, Llama3ForCausalLM)
@@ -168,12 +170,7 @@ def test_hf_loader_loads_safetensors_weights(tmp_path: Path) -> None:
         use_safetensors=True,
     )
 
-    loader = HuggingFaceModelLoader(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-        )
-    )
+    loader = DefaultModelLoader(_make_loader_config(model_dir))
     loaded_model = loader.load_model()
 
     assert isinstance(loaded_model, Qwen3ForCausalLM)
@@ -193,20 +190,14 @@ def test_default_loader_loads_sharded_safetensors_with_multithread(
     )
     monkeypatch.setenv("KVCORE_WEIGHT_LOAD_THREADS", "2")
 
-    loader = DefaultModelLoader(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-            load_format="safetensors",
-        )
-    )
+    loader = DefaultModelLoader(_make_loader_config(model_dir, load_format="safetensors"))
     loaded_model = loader.load_model()
 
     assert isinstance(loaded_model, Qwen3ForCausalLM)
     _assert_same_state_dict(reference_model, loaded_model)
 
 
-def test_model_runner_create_model_then_load_model(tmp_path: Path) -> None:
+def test_model_runner_load_model(tmp_path: Path) -> None:
     torch.manual_seed(0)
     reference_model = MistralForCausalLM(_make_kvcore_config(_make_tiny_mistral_config()))
     model_dir = _write_pretrained_dir(
@@ -216,15 +207,7 @@ def test_model_runner_create_model_then_load_model(tmp_path: Path) -> None:
         use_safetensors=False,
     )
 
-    runner = ModelRunner(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-        )
-    )
-
-    empty_model = runner.create_model()
-    assert isinstance(empty_model, MistralForCausalLM)
+    runner = ModelRunner(_make_loader_config(model_dir))
 
     loaded_model = runner.load_model()
     assert isinstance(loaded_model, MistralForCausalLM)
@@ -268,13 +251,7 @@ def test_default_loader_supports_pt_load_format(tmp_path: Path) -> None:
         use_safetensors=False,
     )
 
-    loader = DefaultModelLoader(
-        ModelLoadConfig(
-            model=str(model_dir),
-            local_files_only=True,
-            load_format="hf",
-        )
-    )
+    loader = DefaultModelLoader(_make_loader_config(model_dir, load_format="hf"))
     loaded_model = loader.load_model()
 
     assert isinstance(loaded_model, Llama3ForCausalLM)

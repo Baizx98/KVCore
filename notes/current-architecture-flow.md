@@ -46,10 +46,10 @@ KVCore 当前已经形成了一个 vLLM 风格但更精简的推理骨架：
 
 `kvcore/model/model_loader` 分三层：
 
-- `KVCoreConfig`：当前主配置入口，包含 model/runtime/scheduler 三组配置。
-- `ModelConfig.hf_config`：保存 Hugging Face config，模型顶层从 `kvcore_config.model.hf_config` 读取具体 `LlamaConfig/Qwen3Config/MistralConfig`。
-- `ModelLoadConfig`：旧兼容入口，描述模型路径、revision、load format、device、attention backend；进入 `EngineCore` 后会转换到 `KVCoreConfig.model`。
-- `DefaultModelLoader`：读取 HF config，将其注入 `KVCoreConfig.model.hf_config`，再按 `model_type` 创建模型，遍历 safetensors/bin/pt 权重。
+- `KVCoreConfig`：唯一运行时配置入口，组合 `model_config/load_config/cache_config/scheduler_config/device_config`。
+- `ModelConfig.hf_config`：保存 Hugging Face config，模型顶层从 `kvcore_config.model_config.hf_config` 读取具体 `LlamaConfig/Qwen3Config/MistralConfig`。
+- `LoadConfig`：描述 revision、load format、download dir、local files、strict loading 等权重加载策略；模型路径、trust remote code、dtype、attention backend 属于 `ModelConfig`，设备属于 `DeviceConfig`。
+- `DefaultModelLoader`：读取 HF config，将其注入 `KVCoreConfig.model_config.hf_config`，再按 `model_type` 创建模型，遍历 safetensors/bin/pt 权重。
 - 模型类自己的 `load_weights()`：完成 HF 权重名到本地参数的加载。
 
 当前模型：
@@ -257,7 +257,6 @@ slot_id = block_number * block_size + block_offset
 
 模型生命周期：
 
-- `create_model()`
 - `load_model()`
 
 KV runtime：
@@ -286,23 +285,16 @@ KV tensor 首版布局是一块所有层共享的连续大 tensor：
 
 `ModelRunner.profile_run()` 会生成一次轻量 KV cache profile 结果，`EngineCore` 只保存该结果并把解析后的 block 数交给 `Scheduler/KVManager`：
 
-- 手动设置 `KVCoreConfig.runtime.num_gpu_blocks` 时，runner profile 记录当前配置能支撑的单序列 token 上限。
-- 设置 `KVCoreConfig.runtime.profile_kv_cache=True` 或 `num_gpu_blocks=None` 时，runner 会根据当前设备可用内存和单个 KV block 字节数估算 `num_gpu_blocks`。
+- 手动设置 `KVCoreConfig.cache_config.num_gpu_blocks` 时，runner profile 记录当前配置能支撑的单序列 token 上限。
+- 设置 `KVCoreConfig.cache_config.profile_kv_cache=True` 或 `num_gpu_blocks=None` 时，runner 会根据当前设备可用内存和单个 KV block 字节数估算 `num_gpu_blocks`。
 - 该 profile 遵循 vLLM “runner owns model/device/KV tensor profiling” 的职责边界，但不引入 worker/executor 层。
 
 ## Current Execution Flow
 
-### 1. Create Or Load Model
+### 1. Load Model
 
 ```text
-ModelRunner(KVCoreConfig | ModelConfig | ModelLoadConfig)
-  -> create_model()
-     -> DefaultModelLoader.load_config_from_source()
-     -> DefaultModelLoader.create_model()
-
-或
-
-ModelRunner(KVCoreConfig | ModelConfig | ModelLoadConfig)
+ModelRunner(KVCoreConfig)
   -> load_model()
      -> create model
      -> load checkpoint weights
@@ -315,7 +307,7 @@ ModelRunner(KVCoreConfig | ModelConfig | ModelLoadConfig)
 ```text
 KVLayerSpec per layer
   -> KVManagerConfig
-  -> Scheduler(KVManagerConfig)
+  -> Scheduler(KVCoreConfig, KVManagerConfig)
      -> KVManager(config)
   -> ModelRunner.initialize_kv_cache()
      -> initialize_kv_cache_tensor()

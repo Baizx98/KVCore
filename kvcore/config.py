@@ -1,70 +1,50 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kvcore.sched.utils import SchedulerConfig
+import torch
 
 if TYPE_CHECKING:
     from transformers.configuration_utils import PretrainedConfig
 
-    from kvcore.model.model_loader.base_loader import LoadConfig
-
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    model: str
-    revision: str | None = None
+    model: str | Path
+    tokenizer: str | Path | None = None
     trust_remote_code: bool = False
-    local_files_only: bool = False
-    load_format: str = "auto"
-    download_dir: str | None = None
-    ignore_patterns: list[str] = field(default_factory=list)
-    attn_backend: str | None = None
-    device: str | None = None
     hf_config: PretrainedConfig | None = None
+    dtype: torch.dtype | None = None
+    max_model_len: int | None = None
+    attn_backend: str | None = None
 
-    @classmethod
-    def from_load_config(cls, load_config: LoadConfig) -> ModelConfig:
-        return cls(
-            model=str(load_config.model),
-            revision=load_config.revision,
-            trust_remote_code=load_config.trust_remote_code,
-            local_files_only=load_config.local_files_only,
-            load_format=load_config.load_format,
-            download_dir=load_config.download_dir,
-            ignore_patterns=list(load_config.ignore_patterns),
-            attn_backend=load_config.attn_backend,
-            device=load_config.device,
-        )
+    def __post_init__(self) -> None:
+        if self.max_model_len is not None and self.max_model_len <= 0:
+            raise ValueError(f"max_model_len must be positive, got {self.max_model_len}")
 
     def with_hf_config(self, hf_config: PretrainedConfig) -> ModelConfig:
-        config = replace(self, hf_config=hf_config)
-        return config
-
-    def to_load_config(self) -> LoadConfig:
-        from kvcore.model.model_loader.base_loader import LoadConfig
-
-        return LoadConfig(
-            model=self.model,
-            revision=self.revision,
-            trust_remote_code=self.trust_remote_code,
-            local_files_only=self.local_files_only,
-            load_format=self.load_format,
-            download_dir=self.download_dir,
-            ignore_patterns=list(self.ignore_patterns),
-            attn_backend=self.attn_backend,
-            device=self.device,
-        )
+        return replace(self, hf_config=hf_config)
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeConfig:
+class LoadConfig:
+    revision: str | None = None
+    load_format: str = "auto"
+    download_dir: str | None = None
+    ignore_patterns: list[str] = field(default_factory=list)
+    local_files_only: bool = False
+    strict: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CacheConfig:
     block_size: int = 16
     num_gpu_blocks: int | None = 2048
-    max_model_len: int | None = None
     profile_kv_cache: bool = False
     gpu_memory_utilization: float = 0.9
+    enable_caching: bool = True
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -79,14 +59,77 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SchedulerConfig:
+    max_num_seqs: int = 8
+    max_num_scheduled_tokens: int = 512
+    max_num_partial_prefills: int = 1
+    max_long_partial_prefills: int = 1
+    long_prefill_token_threshold: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_num_seqs <= 0:
+            raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
+        if self.max_num_scheduled_tokens <= 0:
+            raise ValueError(
+                "max_num_scheduled_tokens must be positive, "
+                f"got {self.max_num_scheduled_tokens}"
+            )
+        if self.max_num_partial_prefills <= 0:
+            raise ValueError(
+                "max_num_partial_prefills must be positive, "
+                f"got {self.max_num_partial_prefills}"
+            )
+        if self.max_long_partial_prefills <= 0:
+            raise ValueError(
+                "max_long_partial_prefills must be positive, "
+                f"got {self.max_long_partial_prefills}"
+            )
+        if self.long_prefill_token_threshold < 0:
+            raise ValueError(
+                "long_prefill_token_threshold must be non-negative, "
+                f"got {self.long_prefill_token_threshold}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceConfig:
+    device: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class KVCoreConfig:
-    model: ModelConfig
-    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    model_config: ModelConfig
+    load_config: LoadConfig = field(default_factory=LoadConfig)
+    cache_config: CacheConfig = field(default_factory=CacheConfig)
+    scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
+    device_config: DeviceConfig = field(default_factory=DeviceConfig)
+
+    def __post_init__(self) -> None:
+        if self.model_config.attn_backend is not None:
+            return
+        object.__setattr__(
+            self,
+            "model_config",
+            replace(
+                self.model_config,
+                attn_backend=self._default_attn_backend(self.device_config.device),
+            ),
+        )
+
+    @staticmethod
+    def _default_attn_backend(device: str | None) -> str:
+        if (device is None and torch.cuda.is_available()) or (
+            device is not None and torch.device(device).type == "cuda"
+        ):
+            return "triton_paged"
+        return "torch_paged"
 
 
 __all__ = [
+    "CacheConfig",
+    "DeviceConfig",
     "KVCoreConfig",
+    "LoadConfig",
     "ModelConfig",
-    "RuntimeConfig",
+    "SchedulerConfig",
 ]

@@ -10,9 +10,15 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, TextIO
 
-from kvcore.config import KVCoreConfig, ModelConfig, RuntimeConfig
+from kvcore.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVCoreConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+)
 from kvcore.entry.llm_engine import GenerationRequest, LLMEngine
-from kvcore.sched.utils import SchedulerConfig
 from kvcore.utils.log import configure_logging
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -197,26 +203,28 @@ def main() -> None:
 
 def build_config(args: argparse.Namespace) -> KVCoreConfig:
     return KVCoreConfig(
-        model=ModelConfig(
+        model_config=ModelConfig(
             model=str(Path(args.model).expanduser()),
-            revision=args.revision,
             trust_remote_code=args.trust_remote_code,
-            local_files_only=args.local_files_only,
             attn_backend=args.attn_backend,
-            device=args.device,
-        ),
-        runtime=RuntimeConfig(
-            block_size=args.block_size,
-            num_gpu_blocks=args.num_gpu_blocks,
             max_model_len=args.max_model_len,
         ),
-        scheduler=SchedulerConfig(
+        load_config=LoadConfig(
+            revision=args.revision,
+            local_files_only=args.local_files_only,
+        ),
+        cache_config=CacheConfig(
+            block_size=args.block_size,
+            num_gpu_blocks=args.num_gpu_blocks,
+        ),
+        scheduler_config=SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             max_num_scheduled_tokens=args.max_num_scheduled_tokens,
             max_num_partial_prefills=args.max_num_partial_prefills,
             max_long_partial_prefills=args.max_long_partial_prefills,
             long_prefill_token_threshold=args.long_prefill_token_threshold,
         ),
+        device_config=DeviceConfig(device=args.device),
     )
 
 

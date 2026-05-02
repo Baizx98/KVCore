@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import Generator, Iterable
 
 import torch
 from safetensors import safe_open

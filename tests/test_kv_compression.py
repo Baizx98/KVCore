@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from kvcore.config import KVCoreConfig, ModelConfig
 from kvcore.kv.compression import KVCompressionConfig, RandomKVBlockCompressor
 from kvcore.kv.kv_manager import KVManager, KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
@@ -19,6 +20,10 @@ def make_kv_config() -> KVManagerConfig:
             KVLayerSpec(1, 2, 2, 8, torch.float16),
         ),
     )
+
+
+def make_config() -> KVCoreConfig:
+    return KVCoreConfig(model_config=ModelConfig(model="unused", attn_backend="torch_paged"))
 
 
 def make_request(request_id: str = "req") -> Request:
@@ -50,7 +55,7 @@ def test_random_kv_block_compressor_permanently_evicts_selected_blocks() -> None
 
 
 def test_scheduler_exposes_random_kv_compression_entrypoint() -> None:
-    scheduler = Scheduler(make_kv_config())
+    scheduler = Scheduler(make_config(), make_kv_config())
     request = make_request()
     scheduler.add_request(request)
     scheduler.schedule()

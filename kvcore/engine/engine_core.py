@@ -4,53 +4,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import torch
-
-from kvcore.config import KVCoreConfig, ModelConfig, RuntimeConfig
+from kvcore.config import KVCoreConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
-from kvcore.model.model_loader.base_loader import LoadConfig
 from kvcore.model.model_runner import KVCacheProfileResult, ModelRunner
 from kvcore.sched.scheduler import Scheduler
-from kvcore.sched.utils import RequestStepOutput, SchedulerConfig
+from kvcore.sched.utils import RequestStepOutput
 from kvcore.utils.log import get_logger
 from kvcore.utils.request import FinishReason, Request
 from kvcore.utils.sampling_params import SamplingParams
 from kvcore.utils.tokenizer import TokenizerManager
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class EngineConfig:
-    block_size: int = 16
-    num_gpu_blocks: int | None = 2048
-    max_num_seqs: int = 8
-    max_num_scheduled_tokens: int = 512
-    max_num_partial_prefills: int = 1
-    max_long_partial_prefills: int = 1
-    long_prefill_token_threshold: int = 0
-    max_model_len: int | None = None
-    profile_kv_cache: bool = False
-    gpu_memory_utilization: float = 0.9
-
-    def __post_init__(self) -> None:
-        if self.block_size <= 0:
-            raise ValueError(f"block_size must be positive, got {self.block_size}")
-        if self.num_gpu_blocks is not None and self.num_gpu_blocks <= 0:
-            raise ValueError(f"num_gpu_blocks must be positive, got {self.num_gpu_blocks}")
-        if not 0 < self.gpu_memory_utilization <= 1:
-            raise ValueError(
-                "gpu_memory_utilization must be in (0, 1], "
-                f"got {self.gpu_memory_utilization}"
-            )
-        SchedulerConfig(
-            max_num_seqs=self.max_num_seqs,
-            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
-            max_num_partial_prefills=self.max_num_partial_prefills,
-            max_long_partial_prefills=self.max_long_partial_prefills,
-            long_prefill_token_threshold=self.long_prefill_token_threshold,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,42 +37,30 @@ class FinishedRequestOutput:
 class EngineCore:
     def __init__(
         self,
-        load_config: LoadConfig | KVCoreConfig | None = None,
-        engine_config: EngineConfig | None = None,
-        *,
-        config: KVCoreConfig | None = None,
+        config: KVCoreConfig,
     ) -> None:
-        self.config = self._normalize_config(
-            config=config,
-            load_config=load_config,
-            engine_config=engine_config,
-        )
-        load_config = self.config.model.to_load_config()
-        if load_config.attn_backend is None:
-            load_config.attn_backend = self._default_attn_backend(load_config.device)
+        self.config = config
         logger.info(
             "Initializing EngineCore model=%s device=%s attn_backend=%s",
-            load_config.model,
-            load_config.device,
-            load_config.attn_backend,
+            self.config.model_config.model,
+            self.config.device_config.device,
+            self.config.model_config.attn_backend,
         )
-        self.load_config = load_config
-        self.engine_config = self.config.runtime
-        self.model_runner = ModelRunner(load_config)
+        self.model_runner = ModelRunner(config)
         if self.model_runner.model is None:
             self.model_runner.load_model()
         self.tokenizer_manager = TokenizerManager.from_model_source(
-            model=load_config.model,
-            revision=load_config.revision,
-            trust_remote_code=load_config.trust_remote_code,
-            local_files_only=load_config.local_files_only,
+            model=self.config.model_config.tokenizer or self.config.model_config.model,
+            revision=self.config.load_config.revision,
+            trust_remote_code=self.config.model_config.trust_remote_code,
+            local_files_only=self.config.load_config.local_files_only,
         )
         self.stop_token_ids = self._resolve_stop_token_ids()
 
         kv_manager_config = self._build_kv_manager_config()
         self.scheduler = Scheduler(
+            self.config,
             kv_manager_config,
-            scheduler_config=self.config.scheduler,
         )
         self.model_runner.initialize_kv_cache(kv_manager_config)
         self.finished_outputs: dict[str, FinishedRequestOutput] = {}
@@ -115,7 +68,7 @@ class EngineCore:
             "EngineCore ready num_gpu_blocks=%d block_size=%d max_model_len=%d "
             "num_layers=%d stop_tokens=%d",
             kv_manager_config.num_gpu_blocks,
-            self.config.runtime.block_size,
+            self.config.cache_config.block_size,
             kv_manager_config.max_model_len,
             len(kv_manager_config.layer_specs),
             len(self.stop_token_ids),
@@ -206,7 +159,7 @@ class EngineCore:
         hidden_size = config.hidden_size
         head_size = getattr(config, "head_dim", hidden_size // num_attention_heads)
         max_model_len = (
-            self.config.runtime.max_model_len
+            self.config.model_config.max_model_len
             or getattr(config, "max_position_embeddings", None)
             or getattr(config, "max_model_len", None)
         )
@@ -217,7 +170,7 @@ class EngineCore:
         layer_specs = tuple(
             KVLayerSpec(
                 layer_idx=layer_idx,
-                block_size=self.config.runtime.block_size,
+                block_size=self.config.cache_config.block_size,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
                 dtype=param_dtype,
@@ -226,11 +179,11 @@ class EngineCore:
         )
         self.kv_cache_profile = self.model_runner.profile_run(
             layer_specs=layer_specs,
-            block_size=self.config.runtime.block_size,
+            block_size=self.config.cache_config.block_size,
             max_model_len=max_model_len,
-            requested_num_gpu_blocks=self.config.runtime.num_gpu_blocks,
-            should_profile=self.config.runtime.profile_kv_cache,
-            gpu_memory_utilization=self.config.runtime.gpu_memory_utilization,
+            requested_num_gpu_blocks=self.config.cache_config.num_gpu_blocks,
+            should_profile=self.config.cache_config.profile_kv_cache,
+            gpu_memory_utilization=self.config.cache_config.gpu_memory_utilization,
         )
         logger.info(
             "KV cache profile num_gpu_blocks=%d bytes_per_block=%d "
@@ -244,6 +197,7 @@ class EngineCore:
             num_gpu_blocks=self.kv_cache_profile.num_gpu_blocks,
             max_model_len=max_model_len,
             layer_specs=layer_specs,
+            enable_caching=self.config.cache_config.enable_caching,
         )
 
     def _resolve_stop_token_ids(self) -> set[int]:
@@ -256,58 +210,7 @@ class EngineCore:
             stop_token_ids.update(int(token_id) for token_id in eos_token_id)
         return stop_token_ids
 
-    @classmethod
-    def _normalize_config(
-        cls,
-        *,
-        config: KVCoreConfig | None,
-        load_config: LoadConfig | KVCoreConfig | None,
-        engine_config: EngineConfig | None,
-    ) -> KVCoreConfig:
-        if isinstance(load_config, KVCoreConfig):
-            if config is not None:
-                raise ValueError("KVCoreConfig was provided twice")
-            config = load_config
-            load_config = None
-        if config is not None:
-            if load_config is not None or engine_config is not None:
-                raise ValueError(
-                    "Pass either KVCoreConfig or legacy load_config/engine_config, not both."
-                )
-            return config
-        if load_config is None:
-            raise ValueError("load_config is required when KVCoreConfig is not provided")
-
-        legacy_engine_config = engine_config or EngineConfig()
-        return KVCoreConfig(
-            model=ModelConfig.from_load_config(load_config),
-            runtime=RuntimeConfig(
-                block_size=legacy_engine_config.block_size,
-                num_gpu_blocks=legacy_engine_config.num_gpu_blocks,
-                max_model_len=legacy_engine_config.max_model_len,
-                profile_kv_cache=legacy_engine_config.profile_kv_cache,
-                gpu_memory_utilization=legacy_engine_config.gpu_memory_utilization,
-            ),
-            scheduler=SchedulerConfig(
-                max_num_seqs=legacy_engine_config.max_num_seqs,
-                max_num_scheduled_tokens=legacy_engine_config.max_num_scheduled_tokens,
-                max_num_partial_prefills=legacy_engine_config.max_num_partial_prefills,
-                max_long_partial_prefills=legacy_engine_config.max_long_partial_prefills,
-                long_prefill_token_threshold=legacy_engine_config.long_prefill_token_threshold,
-            ),
-        )
-
-    @staticmethod
-    def _default_attn_backend(device: str | None) -> str:
-        if (device is None and torch.cuda.is_available()) or (
-            device is not None and torch.device(device).type == "cuda"
-        ):
-            return "triton_paged"
-        return "torch_paged"
-
-
 __all__ = [
-    "EngineConfig",
     "EngineCore",
     "EngineCoreOutputs",
     "FinishedRequestOutput",
