@@ -76,8 +76,8 @@ class DefaultModelLoader(BaseModelLoader):
                 kvcore_config=KVCoreConfig(
                     model_config=model_config,
                     load_config=self.load_config,
-                    cache_config=self.config.cache_config,
-                    scheduler_config=self.config.scheduler_config,
+                    cache_config=self.kvcore_config.cache_config,
+                    scheduler_config=self.kvcore_config.scheduler_config,
                     device_config=self.device_config,
                 )
             )
@@ -196,12 +196,12 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
 
-def get_model_loader(config: KVCoreConfig) -> BaseModelLoader:
-    return DefaultModelLoader(config)
+def get_model_loader(kvcore_config: KVCoreConfig) -> BaseModelLoader:
+    return DefaultModelLoader(kvcore_config)
 
 
-def get_model(config: KVCoreConfig) -> nn.Module:
-    return get_model_loader(config).load_model()
+def get_model(kvcore_config: KVCoreConfig) -> nn.Module:
+    return get_model_loader(kvcore_config).load_model()
 
 
 __all__ = ["DefaultModelLoader", "get_model_loader", "get_model", "MODEL_REGISTRY"]

@@ -64,14 +64,14 @@ def make_tiny_mistral_config(**overrides) -> MistralConfig:
 
 
 def make_kvcore_config(hf_config, *, attn_backend=None) -> KVCoreConfig:
-    config = KVCoreConfig(
+    kvcore_config = KVCoreConfig(
         model_config=ModelConfig(
             model="unused",
             attn_backend=attn_backend or "torch_paged",
             hf_config=hf_config,
         )
     )
-    return config
+    return kvcore_config
 
 
 class ZeroAttentionBackend:

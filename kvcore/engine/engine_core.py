@@ -37,29 +37,29 @@ class FinishedRequestOutput:
 class EngineCore:
     def __init__(
         self,
-        config: KVCoreConfig,
+        kvcore_config: KVCoreConfig,
     ) -> None:
-        self.config = config
+        self.kvcore_config = kvcore_config
         logger.info(
             "Initializing EngineCore model=%s device=%s attn_backend=%s",
-            self.config.model_config.model,
-            self.config.device_config.device,
-            self.config.model_config.attn_backend,
+            self.kvcore_config.model_config.model,
+            self.kvcore_config.device_config.device,
+            self.kvcore_config.model_config.attn_backend,
         )
-        self.model_runner = ModelRunner(config)
+        self.model_runner = ModelRunner(kvcore_config)
         if self.model_runner.model is None:
             self.model_runner.load_model()
         self.tokenizer_manager = TokenizerManager.from_model_source(
-            model=self.config.model_config.tokenizer or self.config.model_config.model,
-            revision=self.config.load_config.revision,
-            trust_remote_code=self.config.model_config.trust_remote_code,
-            local_files_only=self.config.load_config.local_files_only,
+            model=self.kvcore_config.model_config.tokenizer or self.kvcore_config.model_config.model,
+            revision=self.kvcore_config.load_config.revision,
+            trust_remote_code=self.kvcore_config.model_config.trust_remote_code,
+            local_files_only=self.kvcore_config.load_config.local_files_only,
         )
         self.stop_token_ids = self._resolve_stop_token_ids()
 
         kv_manager_config = self._build_kv_manager_config()
         self.scheduler = Scheduler(
-            self.config,
+            self.kvcore_config,
             kv_manager_config,
         )
         self.model_runner.initialize_kv_cache(kv_manager_config)
@@ -68,7 +68,7 @@ class EngineCore:
             "EngineCore ready num_gpu_blocks=%d block_size=%d max_model_len=%d "
             "num_layers=%d stop_tokens=%d",
             kv_manager_config.num_gpu_blocks,
-            self.config.cache_config.block_size,
+            self.kvcore_config.cache_config.block_size,
             kv_manager_config.max_model_len,
             len(kv_manager_config.layer_specs),
             len(self.stop_token_ids),
@@ -159,7 +159,7 @@ class EngineCore:
         hidden_size = config.hidden_size
         head_size = getattr(config, "head_dim", hidden_size // num_attention_heads)
         max_model_len = (
-            self.config.model_config.max_model_len
+            self.kvcore_config.model_config.max_model_len
             or getattr(config, "max_position_embeddings", None)
             or getattr(config, "max_model_len", None)
         )
@@ -170,7 +170,7 @@ class EngineCore:
         layer_specs = tuple(
             KVLayerSpec(
                 layer_idx=layer_idx,
-                block_size=self.config.cache_config.block_size,
+                block_size=self.kvcore_config.cache_config.block_size,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
                 dtype=param_dtype,
@@ -179,11 +179,11 @@ class EngineCore:
         )
         self.kv_cache_profile = self.model_runner.profile_run(
             layer_specs=layer_specs,
-            block_size=self.config.cache_config.block_size,
+            block_size=self.kvcore_config.cache_config.block_size,
             max_model_len=max_model_len,
-            requested_num_gpu_blocks=self.config.cache_config.num_gpu_blocks,
-            should_profile=self.config.cache_config.profile_kv_cache,
-            gpu_memory_utilization=self.config.cache_config.gpu_memory_utilization,
+            requested_num_gpu_blocks=self.kvcore_config.cache_config.num_gpu_blocks,
+            should_profile=self.kvcore_config.cache_config.profile_kv_cache,
+            gpu_memory_utilization=self.kvcore_config.cache_config.gpu_memory_utilization,
         )
         logger.info(
             "KV cache profile num_gpu_blocks=%d bytes_per_block=%d "
@@ -197,7 +197,7 @@ class EngineCore:
             num_gpu_blocks=self.kv_cache_profile.num_gpu_blocks,
             max_model_len=max_model_len,
             layer_specs=layer_specs,
-            enable_caching=self.config.cache_config.enable_caching,
+            enable_caching=self.kvcore_config.cache_config.enable_caching,
         )
 
     def _resolve_stop_token_ids(self) -> set[int]:

@@ -176,7 +176,7 @@ def main() -> None:
             raise ValueError("OFFLINE_REQUESTS is empty; add at least one request.")
 
         engine_start = time.perf_counter()
-        engine = LLMEngine(config=build_config(args))
+        engine = LLMEngine(kvcore_config=build_config(args))
         engine_elapsed = time.perf_counter() - engine_start
         print(f"engine_init_sec={engine_elapsed:.3f}")
         print_request_summary(requests)

@@ -50,14 +50,14 @@ class Scheduler(SchedulerInterface):
 
     def __init__(
         self,
-        config: KVCoreConfig,
+        kvcore_config: KVCoreConfig,
         kv_manager_config: KVManagerConfig,
         *,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
-        self.config = config
+        self.kvcore_config = kvcore_config
         self.metrics_collector = metrics_collector
-        self.scheduler_config = config.scheduler_config
+        self.scheduler_config = kvcore_config.scheduler_config
         self.kv_manager: KVManager = KVManager(
             kv_manager_config,
             metrics_collector=self.metrics_collector,

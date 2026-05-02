@@ -38,8 +38,8 @@ def make_config() -> KVCoreConfig:
     )
 
 
-def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
-    runner = ModelRunner(config)
+def make_tiny_model_runner(kvcore_config: KVCoreConfig) -> ModelRunner:
+    runner = ModelRunner(kvcore_config)
     hf_config = LlamaConfig(
         vocab_size=64,
         hidden_size=32,
@@ -64,15 +64,15 @@ def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
 
 
 def make_async_engine() -> AsyncLLMEngine:
-    config = make_config()
-    return AsyncLLMEngine(config=config)
+    kvcore_config = make_config()
+    return AsyncLLMEngine(kvcore_config=kvcore_config)
 
 
-def install_fake_engine_dependencies(monkeypatch, config: KVCoreConfig) -> None:
+def install_fake_engine_dependencies(monkeypatch, kvcore_config: KVCoreConfig) -> None:
     monkeypatch.setattr(
         engine_core_module,
         "ModelRunner",
-        lambda _config: make_tiny_model_runner(config),
+        lambda _config: make_tiny_model_runner(kvcore_config),
     )
     monkeypatch.setattr(
         engine_core_module.TokenizerManager,

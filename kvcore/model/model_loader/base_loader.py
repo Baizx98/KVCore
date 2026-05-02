@@ -10,11 +10,11 @@ if TYPE_CHECKING:
 
 
 class BaseModelLoader(ABC):
-    def __init__(self, config: KVCoreConfig) -> None:
-        self.config = config
-        self.model_config = config.model_config
-        self.load_config = config.load_config
-        self.device_config = config.device_config
+    def __init__(self, kvcore_config: KVCoreConfig) -> None:
+        self.kvcore_config = kvcore_config
+        self.model_config = kvcore_config.model_config
+        self.load_config = kvcore_config.load_config
+        self.device_config = kvcore_config.device_config
 
     @abstractmethod
     def load_model(self) -> nn.Module:

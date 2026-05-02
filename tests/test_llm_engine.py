@@ -62,8 +62,8 @@ def make_config(
     )
 
 
-def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
-    runner = ModelRunner(config)
+def make_tiny_model_runner(kvcore_config: KVCoreConfig) -> ModelRunner:
+    runner = ModelRunner(kvcore_config)
     hf_config = LlamaConfig(
         vocab_size=64,
         hidden_size=32,
@@ -78,7 +78,7 @@ def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
         KVCoreConfig(
             model_config=ModelConfig(
                 model="unused",
-                attn_backend=config.model_config.attn_backend,
+                attn_backend=kvcore_config.model_config.attn_backend,
                 hf_config=hf_config,
             ),
             device_config=DeviceConfig(device="cpu"),
@@ -87,11 +87,11 @@ def make_tiny_model_runner(config: KVCoreConfig) -> ModelRunner:
     return runner
 
 
-def install_fake_engine_dependencies(monkeypatch, config: KVCoreConfig) -> None:
+def install_fake_engine_dependencies(monkeypatch, kvcore_config: KVCoreConfig) -> None:
     monkeypatch.setattr(
         engine_core_module,
         "ModelRunner",
-        lambda _config: make_tiny_model_runner(config),
+        lambda _config: make_tiny_model_runner(kvcore_config),
     )
     monkeypatch.setattr(
         engine_core_module.TokenizerManager,
@@ -101,9 +101,9 @@ def install_fake_engine_dependencies(monkeypatch, config: KVCoreConfig) -> None:
 
 
 def test_llm_engine_generate_returns_text_and_token_ids(monkeypatch) -> None:
-    config = make_config(max_model_len=32)
-    install_fake_engine_dependencies(monkeypatch, config)
-    engine = LLMEngine(config=config)
+    kvcore_config = make_config(max_model_len=32)
+    install_fake_engine_dependencies(monkeypatch, kvcore_config)
+    engine = LLMEngine(kvcore_config=kvcore_config)
 
     outputs = engine.generate(
         [
@@ -123,20 +123,20 @@ def test_llm_engine_generate_returns_text_and_token_ids(monkeypatch) -> None:
 
 
 def test_llm_engine_accepts_kvcore_config(monkeypatch) -> None:
-    config = make_config(block_size=2, num_gpu_blocks=32, max_model_len=16)
-    install_fake_engine_dependencies(monkeypatch, config)
-    engine = LLMEngine(config=config)
+    kvcore_config = make_config(block_size=2, num_gpu_blocks=32, max_model_len=16)
+    install_fake_engine_dependencies(monkeypatch, kvcore_config)
+    engine = LLMEngine(kvcore_config=kvcore_config)
 
-    assert engine.engine_core.config.model_config.model == "unused"
-    assert engine.engine_core.config.cache_config.block_size == 2
-    assert engine.engine_core.config.scheduler_config.max_num_seqs == 2
+    assert engine.engine_core.kvcore_config.model_config.model == "unused"
+    assert engine.engine_core.kvcore_config.cache_config.block_size == 2
+    assert engine.engine_core.kvcore_config.scheduler_config.max_num_seqs == 2
 
 
 def test_llm_engine_single_request_torch_paged_e2e_outputs_text(monkeypatch) -> None:
     torch.manual_seed(0)
-    config = make_config(max_num_seqs=1, max_num_scheduled_tokens=8, max_model_len=16)
-    install_fake_engine_dependencies(monkeypatch, config)
-    engine = LLMEngine(config=config)
+    kvcore_config = make_config(max_num_seqs=1, max_num_scheduled_tokens=8, max_model_len=16)
+    install_fake_engine_dependencies(monkeypatch, kvcore_config)
+    engine = LLMEngine(kvcore_config=kvcore_config)
 
     outputs = engine.generate(
         [
@@ -156,7 +156,7 @@ def test_llm_engine_single_request_torch_paged_e2e_outputs_text(monkeypatch) -> 
 
 
 def test_engine_profile_run_can_choose_cpu_kv_block_count(monkeypatch) -> None:
-    config = make_config(
+    kvcore_config = make_config(
         block_size=4,
         num_gpu_blocks=None,
         profile_kv_cache=True,
@@ -164,8 +164,8 @@ def test_engine_profile_run_can_choose_cpu_kv_block_count(monkeypatch) -> None:
         max_num_scheduled_tokens=4,
         max_model_len=32,
     )
-    install_fake_engine_dependencies(monkeypatch, config)
-    engine = LLMEngine(config=config)
+    install_fake_engine_dependencies(monkeypatch, kvcore_config)
+    engine = LLMEngine(kvcore_config=kvcore_config)
 
     profile = engine.engine_core.kv_cache_profile
     assert profile.num_gpu_blocks == 17

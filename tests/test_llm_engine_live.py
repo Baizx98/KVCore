@@ -25,7 +25,7 @@ LIVE_MODEL_PATH = Path("/Tan/model/Llama-3.1-8B-Instruct")
 )
 def test_llm_engine_live_llama31_generation() -> None:
     engine = LLMEngine(
-        config=KVCoreConfig(
+        kvcore_config=KVCoreConfig(
             model_config=ModelConfig(model=str(LIVE_MODEL_PATH), max_model_len=512),
             load_config=LoadConfig(local_files_only=True),
             cache_config=CacheConfig(block_size=16, num_gpu_blocks=256),

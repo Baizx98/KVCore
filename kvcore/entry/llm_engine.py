@@ -30,10 +30,10 @@ class GenerationOutput:
 class LLMEngine:
     def __init__(
         self,
-        config: KVCoreConfig,
+        kvcore_config: KVCoreConfig,
     ) -> None:
         logger.info("Initializing LLMEngine")
-        self.engine_core = EngineCore(config=config)
+        self.engine_core = EngineCore(kvcore_config)
 
     def add_request(
         self,

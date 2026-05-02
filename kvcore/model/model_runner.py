@@ -228,9 +228,9 @@ class InputBatch:
 class ModelRunner:
     """Owns model creation, weight loading, and single-step execution."""
 
-    def __init__(self, config: KVCoreConfig) -> None:
-        self.config = config
-        self.model_loader = DefaultModelLoader(config)
+    def __init__(self, kvcore_config: KVCoreConfig) -> None:
+        self.kvcore_config = kvcore_config
+        self.model_loader = DefaultModelLoader(kvcore_config)
         self.model: nn.Module | None = None
         self.kv_manager_config: KVManagerConfig | None = None
         self.kv_cache_tensor: torch.Tensor | None = None
@@ -239,15 +239,15 @@ class ModelRunner:
         self.last_step_stats: ModelRunnerStepStats | None = None
         logger.info(
             "ModelRunner initialized model=%s device=%s attn_backend=%s",
-            self.config.model_config.model,
-            self.config.device_config.device,
-            self.config.model_config.attn_backend,
+            self.kvcore_config.model_config.model,
+            self.kvcore_config.device_config.device,
+            self.kvcore_config.model_config.attn_backend,
         )
 
     def load_model(self) -> nn.Module:
-        logger.info("Loading model model=%s", self.config.model_config.model)
+        logger.info("Loading model model=%s", self.kvcore_config.model_config.model)
         self.model = self.model_loader.load_model()
-        logger.info("Model loaded model=%s", self.config.model_config.model)
+        logger.info("Model loaded model=%s", self.kvcore_config.model_config.model)
         return self.model
 
     def profile_run(
@@ -702,8 +702,8 @@ class ModelRunner:
         return self.kv_manager_config
 
     def _resolve_device(self) -> torch.device:
-        if self.config.device_config.device is not None:
-            return torch.device(self.config.device_config.device)
+        if self.kvcore_config.device_config.device is not None:
+            return torch.device(self.kvcore_config.device_config.device)
         if self.model is not None:
             try:
                 return next(self.model.parameters()).device

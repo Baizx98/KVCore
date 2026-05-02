@@ -18,10 +18,10 @@ class AsyncLLMEngine:
 
     def __init__(
         self,
-        config: KVCoreConfig,
+        kvcore_config: KVCoreConfig,
     ) -> None:
         logger.info("Initializing AsyncLLMEngine")
-        self.engine_core = EngineCore(config=config)
+        self.engine_core = EngineCore(kvcore_config)
         self._pending_queue: asyncio.Queue[GenerationRequest] = asyncio.Queue()
         self._futures: dict[str, asyncio.Future[GenerationOutput]] = {}
 
