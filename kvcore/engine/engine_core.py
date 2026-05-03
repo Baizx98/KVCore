@@ -50,7 +50,10 @@ class EngineCore:
         if self.model_runner.model is None:
             self.model_runner.load_model()
         self.tokenizer_manager = TokenizerManager.from_model_source(
-            model=self.kvcore_config.model_config.tokenizer or self.kvcore_config.model_config.model,
+            model=(
+                self.kvcore_config.model_config.tokenizer
+                or self.kvcore_config.model_config.model
+            ),
             revision=self.kvcore_config.load_config.revision,
             trust_remote_code=self.kvcore_config.model_config.trust_remote_code,
             local_files_only=self.kvcore_config.load_config.local_files_only,
@@ -108,14 +111,16 @@ class EngineCore:
             scheduler_output.total_num_scheduled_tokens,
         )
 
-        model_step_output = self.model_runner.execute_model(
+        model_runner_output = self.model_runner.execute_model(
             scheduler_output=scheduler_output,
         )
+        if model_runner_output is None:
+            model_runner_output = self.model_runner.sample_tokens()
         sampled_token_map = {
             req_id: token_ids[0]
             for req_id, token_ids in zip(
-                model_step_output.req_ids,
-                model_step_output.sampled_token_ids,
+                model_runner_output.req_ids,
+                model_runner_output.sampled_token_ids,
                 strict=True,
             )
             if token_ids

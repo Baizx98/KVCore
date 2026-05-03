@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+import kvcore.model.input_batch as input_batch_module
 from kvcore.config import DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
@@ -150,8 +151,28 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
 
     scheduler.add_request(make_request())
     scheduler_output = scheduler.schedule()
-    runner.input_batch.update_from_scheduler_output(scheduler_output)
-    metadata = runner.build_attention_metadata(scheduler_output)
+    runner._update_states(scheduler_output)
+    num_scheduled_tokens = tuple(
+        scheduler_output.num_scheduled_tokens[req_id]
+        for req_id in runner._require_input_batch().req_ids
+    )
+    (
+        _logits_indices,
+        _sampled_request_ids,
+        _sampling_params,
+        num_prefill_reqs,
+        num_decode_reqs,
+        max_query_len,
+        max_seq_len,
+    ) = runner._prepare_inputs(scheduler_output, num_scheduled_tokens)
+    metadata = runner._build_attention_metadata(
+        num_reqs=runner._require_input_batch().num_reqs,
+        num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        num_prefill_reqs=num_prefill_reqs,
+        num_decode_reqs=num_decode_reqs,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+    )
 
     assert metadata.num_reqs == 1
     assert metadata.num_scheduled_tokens == 4
@@ -164,20 +185,49 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
     assert metadata.kv_cache_tensor is runner.kv_cache_tensor
 
 
-def test_model_runner_prepares_model_input_from_scheduler_output_fixture() -> None:
+def test_input_batch_metadata_wrapper_is_removed() -> None:
+    assert not hasattr(input_batch_module, "InputBatchMetadata")
+
+
+def test_model_runner_prepares_inputs_from_input_batch_buffers() -> None:
     runner = make_runner_with_tiny_model()
     kv_config = make_kv_config()
     runner.initialize_kv_cache(kv_config)
 
     scheduler_output = make_manual_scheduler_output()
-    runner.input_batch.update_from_scheduler_output(scheduler_output)
-    model_input = runner.prepare_model_input(scheduler_output)
+    runner._update_states(scheduler_output)
+    input_batch = runner._require_input_batch()
+    assert input_batch.token_ids_cpu[0, :2].tolist() == [7, 8]
+    assert input_batch.num_tokens[0] == 2
+    assert input_batch.num_prompt_tokens[0] == 2
+    assert input_batch.num_computed_tokens_cpu[0] == 0
 
-    assert model_input.input_ids.tolist() == [7, 8]
-    assert model_input.positions.tolist() == [0, 1]
-    assert model_input.sample_indices == (1,)
-    assert model_input.sampled_request_ids == ("req",)
-    assert model_input.attn_metadata.kv_cache_tensor is runner.kv_cache_tensor
+    (
+        logits_indices,
+        sampled_request_ids,
+        sampling_params,
+        num_prefill_reqs,
+        num_decode_reqs,
+        max_query_len,
+        max_seq_len,
+    ) = runner._prepare_inputs(scheduler_output, (2,))
+    attn_metadata = runner._build_attention_metadata(
+        num_reqs=1,
+        num_scheduled_tokens=2,
+        num_prefill_reqs=num_prefill_reqs,
+        num_decode_reqs=num_decode_reqs,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+    )
+
+    assert runner.input_ids is not None
+    assert runner.positions is not None
+    assert runner.input_ids[:2].tolist() == [7, 8]
+    assert runner.positions[:2].tolist() == [0, 1]
+    assert logits_indices.tolist() == [1]
+    assert sampled_request_ids == ("req",)
+    assert len(sampling_params) == 1
+    assert attn_metadata.kv_cache_tensor is runner.kv_cache_tensor
 
 
 def test_model_runner_batch_tracks_chunked_prefill_and_decode_tokens() -> None:
@@ -195,27 +245,54 @@ def test_model_runner_batch_tracks_chunked_prefill_and_decode_tokens() -> None:
     scheduler.add_request(make_request(token_ids=[1, 2, 3, 4, 5, 6], max_tokens=2))
 
     first = scheduler.schedule()
-    runner.input_batch.update_from_scheduler_output(first)
-    first_input = runner.prepare_model_input(first)
-    assert first_input.input_ids.tolist() == [1, 2, 3, 4]
-    assert first_input.positions.tolist() == [0, 1, 2, 3]
-    assert first_input.sample_indices == ()
+    runner._update_states(first)
+    first_tokens = tuple(
+        first.num_scheduled_tokens[req_id]
+        for req_id in runner._require_input_batch().req_ids
+    )
+    first_logits_indices, first_sampled_request_ids, *_ = runner._prepare_inputs(
+        first,
+        first_tokens,
+    )
+    assert runner.input_ids is not None
+    assert runner.positions is not None
+    assert runner.input_ids[:4].tolist() == [1, 2, 3, 4]
+    assert runner.positions[:4].tolist() == [0, 1, 2, 3]
+    assert first_logits_indices.tolist() == []
+    assert first_sampled_request_ids == ()
     scheduler.update_from_outputs(first, {})
 
     second = scheduler.schedule()
-    runner.input_batch.update_from_scheduler_output(second)
-    second_input = runner.prepare_model_input(second)
-    assert second_input.input_ids.tolist() == [5, 6]
-    assert second_input.positions.tolist() == [4, 5]
-    assert second_input.sample_indices == (1,)
+    runner._update_states(second)
+    second_tokens = tuple(
+        second.num_scheduled_tokens[req_id]
+        for req_id in runner._require_input_batch().req_ids
+    )
+    second_logits_indices, second_sampled_request_ids, *_ = runner._prepare_inputs(
+        second,
+        second_tokens,
+    )
+    assert runner.input_ids[:2].tolist() == [5, 6]
+    assert runner.positions[:2].tolist() == [4, 5]
+    assert second_logits_indices.tolist() == [1]
+    assert second_sampled_request_ids == ("req",)
+    runner._require_input_batch().record_sampled_tokens(("req",), (9,))
     scheduler.update_from_outputs(second, {"req": 9})
 
     third = scheduler.schedule()
-    runner.input_batch.update_from_scheduler_output(third)
-    third_input = runner.prepare_model_input(third)
-    assert third_input.input_ids.tolist() == [9]
-    assert third_input.positions.tolist() == [6]
-    assert third_input.sample_indices == (0,)
+    runner._update_states(third)
+    third_tokens = tuple(
+        third.num_scheduled_tokens[req_id]
+        for req_id in runner._require_input_batch().req_ids
+    )
+    third_logits_indices, third_sampled_request_ids, *_ = runner._prepare_inputs(
+        third,
+        third_tokens,
+    )
+    assert runner.input_ids[:1].tolist() == [9]
+    assert runner.positions[:1].tolist() == [6]
+    assert third_logits_indices.tolist() == [0]
+    assert third_sampled_request_ids == ("req",)
 
 
 def test_model_runner_execute_model_uses_forward_context_not_model_kwargs() -> None:
@@ -227,13 +304,18 @@ def test_model_runner_execute_model_uses_forward_context_not_model_kwargs() -> N
     assert runner.kv_cache_tensor is not None
     runner.kv_cache_tensor.fill_(1)
 
-    step_output = runner.execute_model(make_manual_scheduler_output())
+    model_runner_output = runner.execute_model(make_manual_scheduler_output())
 
     assert len(spy_model.calls) == 1
     assert spy_model.calls[0]["input_ids"].tolist() == [7, 8]
     assert spy_model.calls[0]["positions"].tolist() == [0, 1]
-    assert step_output.req_ids == ("req",)
-    assert step_output.sampled_token_ids == ((5,),)
+    assert model_runner_output is None
+    assert runner.execute_model_state is not None
+    model_runner_output = runner.sample_tokens()
+    assert model_runner_output.req_ids == ["req"]
+    assert model_runner_output.req_id_to_index == {"req": 0}
+    assert model_runner_output.sampled_token_ids == [[5]]
+    assert runner.execute_model_state is None
     assert runner.last_step_stats is not None
     assert runner.last_step_stats.num_reqs == 1
     assert runner.last_step_stats.num_scheduled_tokens == 2
@@ -256,8 +338,10 @@ def test_model_runner_execute_model_samples_requested_positions() -> None:
 
     scheduler.add_request(make_request(token_ids=[1, 2, 3, 4]))
     scheduler_output = scheduler.schedule()
-    step_output = runner.execute_model(scheduler_output)
+    model_runner_output = runner.execute_model(scheduler_output)
+    assert model_runner_output is None
+    model_runner_output = runner.sample_tokens()
 
-    assert step_output.req_ids == ("req",)
-    assert len(step_output.sampled_token_ids) == 1
-    assert len(step_output.sampled_token_ids[0]) == 1
+    assert model_runner_output.req_ids == ["req"]
+    assert len(model_runner_output.sampled_token_ids) == 1
+    assert len(model_runner_output.sampled_token_ids[0]) == 1
