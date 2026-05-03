@@ -140,12 +140,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--num-gpu-blocks", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument("--max-num-seqs", type=int, default=4)
-    parser.add_argument("--max-num-scheduled-tokens", type=int, default=128)
-    parser.add_argument("--max-num-partial-prefills", type=int, default=2)
-    parser.add_argument("--max-long-partial-prefills", type=int, default=2)
+    parser.add_argument("--max-num-seqs", type=int, default=1024)
+    parser.add_argument("--max-num-scheduled-tokens", type=int, default=1024)
+    parser.add_argument("--max-num-partial-prefills", type=int, default=128)
+    parser.add_argument("--max-long-partial-prefills", type=int, default=128)
     parser.add_argument("--long-prefill-token-threshold", type=int, default=0)
-    parser.add_argument("--log-level", default="DEBUG")
+    parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--log-file",
         default=None,
