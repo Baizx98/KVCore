@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -20,6 +21,8 @@ from kvcore.utils.sampling_params import SamplingParams
 
 logger = get_logger(__name__)
 
+_KV_CACHE_PROFILE_SAFETY_MARGIN_BYTES = 256 * 1024 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class KVCacheProfileResult:
@@ -28,7 +31,18 @@ class KVCacheProfileResult:
     bytes_per_block: int
     available_memory_bytes: int | None
     memory_budget_bytes: int | None
+    peak_memory_bytes: int | None
+    non_kv_peak_memory_bytes: int | None
     max_tokens_per_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _KVCacheMemoryEstimate:
+    num_gpu_blocks: int
+    available_memory_bytes: int | None = None
+    memory_budget_bytes: int | None = None
+    peak_memory_bytes: int | None = None
+    non_kv_peak_memory_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,25 +135,25 @@ class ModelRunner:
     ) -> KVCacheProfileResult:
         """Resolve KV block capacity from runner-owned model/device state."""
         if requested_num_gpu_blocks is None or should_profile:
-            num_gpu_blocks = self._estimate_num_gpu_blocks(
+            estimate = self._estimate_num_gpu_blocks(
                 layer_specs=layer_specs,
                 block_size=block_size,
                 max_model_len=max_model_len,
                 gpu_memory_utilization=gpu_memory_utilization,
             )
         else:
-            num_gpu_blocks = requested_num_gpu_blocks
+            estimate = _KVCacheMemoryEstimate(num_gpu_blocks=requested_num_gpu_blocks)
         logger.info(
             "ModelRunner profile resolved num_gpu_blocks=%d requested=%s "
             "should_profile=%s",
-            num_gpu_blocks,
+            estimate.num_gpu_blocks,
             requested_num_gpu_blocks,
             should_profile,
         )
         return self._build_kv_cache_profile_result(
             layer_specs=layer_specs,
             block_size=block_size,
-            num_gpu_blocks=num_gpu_blocks,
+            estimate=estimate,
             gpu_memory_utilization=gpu_memory_utilization,
         )
 
@@ -593,26 +607,221 @@ class ModelRunner:
         block_size: int,
         max_model_len: int,
         gpu_memory_utilization: float,
-    ) -> int:
+    ) -> _KVCacheMemoryEstimate:
         first_spec = layer_specs[0]
         dtype = first_spec.dtype if isinstance(first_spec.dtype, torch.dtype) else torch.float16
         bytes_per_block = self._get_bytes_per_block(first_spec, dtype)
         device = self._resolve_device()
 
         if device.type == "cuda":
-            free_memory, _total_memory = torch.cuda.mem_get_info(device)
-            budget = int(free_memory * gpu_memory_utilization)
-            return max(1, budget // bytes_per_block)
+            return self._estimate_num_gpu_blocks_with_profile(
+                layer_specs=layer_specs,
+                block_size=block_size,
+                max_model_len=max_model_len,
+                bytes_per_block=bytes_per_block,
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
 
         blocks_per_layer = (max_model_len + block_size - 1) // block_size
-        return max(1, len(layer_specs) * blocks_per_layer + 1)
+        return _KVCacheMemoryEstimate(
+            num_gpu_blocks=max(1, len(layer_specs) * blocks_per_layer + 1),
+        )
+
+    def _estimate_num_gpu_blocks_with_profile(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        block_size: int,
+        max_model_len: int,
+        bytes_per_block: int,
+        gpu_memory_utilization: float,
+    ) -> _KVCacheMemoryEstimate:
+        device = self._resolve_device()
+        torch.cuda.empty_cache()
+        free_memory, total_memory = torch.cuda.mem_get_info(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+
+        profile_tokens = min(
+            max_model_len,
+            max(1, self.kvcore_config.scheduler_config.max_num_scheduled_tokens),
+        )
+        profile_kv_blocks = (profile_tokens + block_size - 1) // block_size + 1
+        try:
+            self._profile_dummy_forward(
+                layer_specs=layer_specs,
+                max_model_len=max_model_len,
+                profile_tokens=profile_tokens,
+                profile_num_gpu_blocks=profile_kv_blocks,
+            )
+            torch.cuda.synchronize(device)
+            peak_memory = int(torch.cuda.max_memory_allocated(device))
+        finally:
+            self._clear_profile_state()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        profile_kv_cache_bytes = profile_kv_blocks * bytes_per_block
+        non_kv_peak_memory = max(0, peak_memory - profile_kv_cache_bytes)
+        post_kv_cache_memory = self._estimate_post_kv_cache_memory_bytes(
+            layer_specs=layer_specs,
+            max_model_len=max_model_len,
+        )
+        total_memory_budget = int(total_memory * gpu_memory_utilization)
+        free_memory_budget = max(
+            0,
+            int(free_memory * gpu_memory_utilization)
+            - post_kv_cache_memory
+            - _KV_CACHE_PROFILE_SAFETY_MARGIN_BYTES,
+        )
+        requested_budget = max(0, total_memory_budget - non_kv_peak_memory)
+        available_for_kv = min(requested_budget, free_memory_budget)
+        num_gpu_blocks = max(1, available_for_kv // bytes_per_block)
+        logger.info(
+            "KV cache memory profile free=%d total=%d peak=%d non_kv_peak=%d "
+            "post_kv_cache=%d safety_margin=%d total_budget=%d free_budget=%d "
+            "available_for_kv=%d bytes_per_block=%d blocks=%d",
+            free_memory,
+            total_memory,
+            peak_memory,
+            non_kv_peak_memory,
+            post_kv_cache_memory,
+            _KV_CACHE_PROFILE_SAFETY_MARGIN_BYTES,
+            total_memory_budget,
+            free_memory_budget,
+            available_for_kv,
+            bytes_per_block,
+            num_gpu_blocks,
+        )
+        return _KVCacheMemoryEstimate(
+            num_gpu_blocks=num_gpu_blocks,
+            available_memory_bytes=int(free_memory),
+            memory_budget_bytes=available_for_kv,
+            peak_memory_bytes=peak_memory,
+            non_kv_peak_memory_bytes=non_kv_peak_memory,
+        )
+
+    @torch.inference_mode()
+    def _profile_dummy_forward(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        max_model_len: int,
+        profile_tokens: int,
+        profile_num_gpu_blocks: int,
+    ) -> None:
+        kv_manager_config = KVManagerConfig(
+            num_gpu_blocks=profile_num_gpu_blocks,
+            max_model_len=max_model_len,
+            layer_specs=layer_specs,
+            enable_caching=False,
+        )
+        self.kv_manager_config = kv_manager_config
+        self.kv_cache_tensor = self.initialize_kv_cache_tensor(kv_manager_config)
+        self.input_batch = self._make_input_batch(kv_manager_config, max_num_reqs=1)
+        self._init_step_buffers()
+
+        num_profile_blocks = (profile_tokens + layer_specs[0].block_size - 1) // layer_specs[
+            0
+        ].block_size
+        block_ids = tuple(tuple(range(1, num_profile_blocks + 1)) for _ in layer_specs)
+        request = CachedRequestState(
+            req_id="__kvcore_profile__",
+            prompt_token_ids=list(range(profile_tokens)),
+            sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+            block_ids=block_ids,
+            num_computed_tokens=0,
+        )
+        self.requests[request.req_id] = request
+        self._require_input_batch().add_request(request)
+
+        assert self.input_ids is not None
+        assert self.positions is not None
+        assert self.query_start_loc is not None
+        assert self.seq_lens is not None
+        assert self.context_lens is not None
+        assert self.query_lens is not None
+        assert self.token_request_indices is not None
+        model_config = getattr(self._require_model(), "config", None)
+        vocab_size = max(1, int(getattr(model_config, "vocab_size", 1)))
+        self.input_ids[:profile_tokens] = torch.remainder(
+            torch.arange(profile_tokens, dtype=torch.long, device=self.input_ids.device),
+            vocab_size,
+        )
+        self.positions[:profile_tokens] = torch.arange(
+            profile_tokens,
+            dtype=torch.long,
+            device=self.positions.device,
+        )
+        self.query_start_loc[:2] = torch.tensor(
+            [0, profile_tokens],
+            dtype=torch.int32,
+            device=self.query_start_loc.device,
+        )
+        self.seq_lens[:1] = profile_tokens
+        self.context_lens[:1] = 0
+        self.query_lens[:1] = profile_tokens
+        self.token_request_indices[:profile_tokens] = 0
+
+        attn_metadata = self._build_attention_metadata(
+            num_reqs=1,
+            num_scheduled_tokens=profile_tokens,
+            num_prefill_reqs=1,
+            num_decode_reqs=0,
+            max_query_len=profile_tokens,
+            max_seq_len=profile_tokens,
+        )
+        hidden_states = self._run_forward(attn_metadata, profile_tokens)
+        del hidden_states
+
+    def _clear_profile_state(self) -> None:
+        self.kv_manager_config = None
+        self.kv_cache_tensor = None
+        self.input_batch = None
+        self.requests.clear()
+        self.execute_model_state = None
+        self.last_step_stats = None
+        self.input_ids = None
+        self.positions = None
+        self.query_start_loc = None
+        self.seq_lens = None
+        self.context_lens = None
+        self.query_lens = None
+        self.token_request_indices = None
+
+    def _estimate_post_kv_cache_memory_bytes(
+        self,
+        *,
+        layer_specs: tuple[KVLayerSpec, ...],
+        max_model_len: int,
+    ) -> int:
+        scheduler_config = self.kvcore_config.scheduler_config
+        max_num_reqs = max(1, scheduler_config.max_num_seqs)
+        max_num_scheduled_tokens = max(1, scheduler_config.max_num_scheduled_tokens)
+        int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+        int64_bytes = torch.empty((), dtype=torch.int64).element_size()
+
+        block_table_bytes = sum(
+            max_num_reqs
+            * ((max_model_len + layer_spec.block_size - 1) // layer_spec.block_size)
+            * int32_bytes
+            for layer_spec in layer_specs
+        )
+        slot_mapping_bytes = len(layer_specs) * max_num_scheduled_tokens * int64_bytes
+        step_buffer_bytes = (
+            max_num_scheduled_tokens * int64_bytes * 2
+            + max_num_scheduled_tokens * int32_bytes
+            + (max_num_reqs + 1) * int32_bytes
+            + max_num_reqs * int32_bytes * 3
+        )
+        return block_table_bytes + slot_mapping_bytes + step_buffer_bytes
 
     def _build_kv_cache_profile_result(
         self,
         *,
         layer_specs: tuple[KVLayerSpec, ...],
         block_size: int,
-        num_gpu_blocks: int,
+        estimate: _KVCacheMemoryEstimate,
         gpu_memory_utilization: float,
     ) -> KVCacheProfileResult:
         first_spec = layer_specs[0]
@@ -622,10 +831,14 @@ class ModelRunner:
         available_memory_bytes: int | None = None
         memory_budget_bytes: int | None = None
         if device.type == "cuda":
-            free_memory, _total_memory = torch.cuda.mem_get_info(device)
-            available_memory_bytes = int(free_memory)
-            memory_budget_bytes = int(free_memory * gpu_memory_utilization)
+            available_memory_bytes = estimate.available_memory_bytes
+            memory_budget_bytes = estimate.memory_budget_bytes
+            if available_memory_bytes is None or memory_budget_bytes is None:
+                free_memory, _total_memory = torch.cuda.mem_get_info(device)
+                available_memory_bytes = int(free_memory)
+                memory_budget_bytes = int(free_memory * gpu_memory_utilization)
 
+        num_gpu_blocks = estimate.num_gpu_blocks
         usable_blocks = max(num_gpu_blocks - 1, 0)
         max_tokens_per_sequence = (usable_blocks // len(layer_specs)) * block_size
         return KVCacheProfileResult(
@@ -634,6 +847,8 @@ class ModelRunner:
             bytes_per_block=bytes_per_block,
             available_memory_bytes=available_memory_bytes,
             memory_budget_bytes=memory_budget_bytes,
+            peak_memory_bytes=estimate.peak_memory_bytes,
+            non_kv_peak_memory_bytes=estimate.non_kv_peak_memory_bytes,
             max_tokens_per_sequence=max_tokens_per_sequence,
         )
 
@@ -647,11 +862,18 @@ class ModelRunner:
             * torch.empty((), dtype=dtype).element_size()
         )
 
-    def _make_input_batch(self, kv_manager_config: KVManagerConfig) -> InputBatch:
+    def _make_input_batch(
+        self,
+        kv_manager_config: KVManagerConfig,
+        *,
+        max_num_reqs: int | None = None,
+    ) -> InputBatch:
         device = self._resolve_device()
         block_sizes = [spec.block_size for spec in kv_manager_config.layer_specs]
         return InputBatch(
-            max_num_reqs=max(1, self.kvcore_config.scheduler_config.max_num_seqs),
+            max_num_reqs=max_num_reqs
+            if max_num_reqs is not None
+            else max(1, self.kvcore_config.scheduler_config.max_num_seqs),
             max_model_len=kv_manager_config.max_model_len,
             max_num_batched_tokens=max(
                 1,

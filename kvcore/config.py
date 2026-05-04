@@ -41,8 +41,8 @@ class LoadConfig:
 @dataclass(frozen=True, slots=True)
 class CacheConfig:
     block_size: int = 16
-    num_gpu_blocks: int | None = 2048
-    profile_kv_cache: bool = False
+    num_gpu_blocks: int | None = None
+    profile_kv_cache: bool = True
     gpu_memory_utilization: float = 0.9
     enable_caching: bool = True
 

@@ -5,7 +5,7 @@ from torch import nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 import kvcore.model.input_batch as input_batch_module
-from kvcore.config import DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
+from kvcore.config import CacheConfig, DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
 from kvcore.model.model_runner import ModelRunner
@@ -134,6 +134,96 @@ def test_model_runner_initializes_global_kv_cache_tensor() -> None:
     assert runner.kv_cache_tensor is not None
     assert kv_cache_tensor is runner.kv_cache_tensor
     assert runner.kv_cache_tensor.shape == (2, 16, 2, 2, 8)
+
+
+def test_model_runner_cuda_profile_uses_peak_memory_budget(monkeypatch) -> None:
+    kvcore_config = KVCoreConfig(
+        model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+        cache_config=CacheConfig(block_size=2, num_gpu_blocks=None),
+        scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=4),
+        device_config=DeviceConfig(device="cuda:0"),
+    )
+    runner = ModelRunner(kvcore_config)
+    runner.model = SpyCausalLM()
+    layer_specs = make_kv_config(num_layers=1).layer_specs
+    cuda_calls: list[str] = []
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (1_000_000_000, 10_000_000_000),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: cuda_calls.append("empty_cache"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "reset_peak_memory_stats",
+        lambda device=None: cuda_calls.append("reset_peak"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device=None: cuda_calls.append("synchronize"),
+    )
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 3_000_000)
+    monkeypatch.setattr(
+        runner,
+        "_profile_dummy_forward",
+        lambda **_kwargs: cuda_calls.append("dummy_forward"),
+    )
+
+    profile = runner.profile_run(
+        layer_specs=layer_specs,
+        block_size=2,
+        max_model_len=16,
+        requested_num_gpu_blocks=None,
+        should_profile=True,
+        gpu_memory_utilization=0.8,
+    )
+
+    bytes_per_block = runner._get_bytes_per_block(layer_specs[0], torch.float16)
+    profile_kv_bytes = 3 * bytes_per_block
+    expected_non_kv_peak = 3_000_000 - profile_kv_bytes
+    expected_post_kv_cache_memory = runner._estimate_post_kv_cache_memory_bytes(
+        layer_specs=layer_specs,
+        max_model_len=16,
+    )
+    expected_available_for_kv = min(
+        8_000_000_000 - expected_non_kv_peak,
+        800_000_000 - expected_post_kv_cache_memory - 256 * 1024 * 1024,
+    )
+    expected_blocks = expected_available_for_kv // bytes_per_block
+    assert profile.num_gpu_blocks == expected_blocks
+    assert profile.available_memory_bytes == 1_000_000_000
+    assert profile.memory_budget_bytes == expected_available_for_kv
+    assert profile.peak_memory_bytes == 3_000_000
+    assert profile.non_kv_peak_memory_bytes == expected_non_kv_peak
+    assert "dummy_forward" in cuda_calls
+    assert runner.kv_cache_tensor is None
+    assert runner.input_batch is None
+    assert runner.requests == {}
+
+
+def test_model_runner_profile_state_can_be_cleared_before_real_kv_init() -> None:
+    runner = make_runner_with_tiny_model()
+    kv_config = make_kv_config()
+
+    runner._profile_dummy_forward(
+        layer_specs=kv_config.layer_specs,
+        max_model_len=kv_config.max_model_len,
+        profile_tokens=4,
+        profile_num_gpu_blocks=3,
+    )
+    assert runner.kv_cache_tensor is not None
+    assert runner.input_batch is not None
+    assert runner.requests
+
+    runner._clear_profile_state()
+    assert runner.kv_cache_tensor is None
+    assert runner.input_batch is None
+    assert runner.requests == {}
+
+    kv_cache_tensor = runner.initialize_kv_cache(kv_config)
+    assert kv_cache_tensor.shape == (2, 16, 2, 2, 8)
 
 
 def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() -> None:

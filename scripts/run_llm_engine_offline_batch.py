@@ -138,7 +138,6 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--num-gpu-blocks", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=1024)
     parser.add_argument("--max-num-scheduled-tokens", type=int, default=1024)
@@ -215,7 +214,6 @@ def build_config(args: argparse.Namespace) -> KVCoreConfig:
         ),
         cache_config=CacheConfig(
             block_size=args.block_size,
-            num_gpu_blocks=args.num_gpu_blocks,
         ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
