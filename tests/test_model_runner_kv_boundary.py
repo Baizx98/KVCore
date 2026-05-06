@@ -5,9 +5,17 @@ from torch import nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 import kvcore.model.input_batch as input_batch_module
-from kvcore.config import CacheConfig, DeviceConfig, KVCoreConfig, ModelConfig, SchedulerConfig
+from kvcore.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVCoreConfig,
+    ModelConfig,
+    SchedulerConfig,
+    SparseKVConfig,
+)
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
+from kvcore.kv.sparse import LayerSparsePlan, SparseKVPlan
 from kvcore.model.model_runner import ModelRunner
 from kvcore.model.models.llama3 import Llama3ForCausalLM
 from kvcore.sched.scheduler import Scheduler
@@ -256,6 +264,7 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
         max_seq_len,
     ) = runner._prepare_inputs(scheduler_output, num_scheduled_tokens)
     metadata = runner._build_attention_metadata(
+        scheduler_output=scheduler_output,
         num_reqs=runner._require_input_batch().num_reqs,
         num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
         num_prefill_reqs=num_prefill_reqs,
@@ -277,6 +286,44 @@ def test_model_runner_builds_paged_attention_metadata_from_scheduler_output() ->
 
 def test_input_batch_metadata_wrapper_is_removed() -> None:
     assert not hasattr(input_batch_module, "InputBatchMetadata")
+
+
+def test_model_runner_materializes_sparse_read_table_from_scheduler_plan() -> None:
+    runner = make_runner_with_tiny_model()
+    runner.initialize_kv_cache(make_kv_config())
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=(
+            NewRequestData(
+                req_id="req",
+                prompt_token_ids=(1, 2, 3, 4, 5, 6),
+                sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+                block_ids=((1, 2, 3), (4, 5, 6)),
+                num_computed_tokens=0,
+            ),
+        ),
+        scheduled_cached_reqs=CachedRequestData.empty(),
+        num_scheduled_tokens={"req": 6},
+        total_num_scheduled_tokens=6,
+        sparse_plan=SparseKVPlan(
+            (
+                LayerSparsePlan(
+                    request_id="req",
+                    layer_idx=0,
+                    selected_block_indices=(0, 2),
+                ),
+            )
+        ),
+    )
+
+    runner._update_states(scheduler_output)
+    runner._materialize_read_block_table(scheduler_output)
+    input_batch = runner._require_input_batch()
+
+    assert input_batch.block_table[0].get_cpu_tensor()[0, :2].tolist() == [1, 3]
+    assert input_batch.block_table[0].block_indices.cpu[0, :2].tolist() == [0, 2]
+    assert int(input_batch.block_table[0].num_blocks_per_row[0]) == 2
+    assert input_batch.block_table[1].get_cpu_tensor()[0, :3].tolist() == [4, 5, 6]
+    assert input_batch.block_table[1].block_indices.cpu[0, :3].tolist() == [0, 1, 2]
 
 
 def test_model_runner_prepares_inputs_from_input_batch_buffers() -> None:
@@ -302,6 +349,7 @@ def test_model_runner_prepares_inputs_from_input_batch_buffers() -> None:
         max_seq_len,
     ) = runner._prepare_inputs(scheduler_output, (2,))
     attn_metadata = runner._build_attention_metadata(
+        scheduler_output=scheduler_output,
         num_reqs=1,
         num_scheduled_tokens=2,
         num_prefill_reqs=num_prefill_reqs,
@@ -435,3 +483,54 @@ def test_model_runner_execute_model_samples_requested_positions() -> None:
     assert model_runner_output.req_ids == ["req"]
     assert len(model_runner_output.sampled_token_ids) == 1
     assert len(model_runner_output.sampled_token_ids[0]) == 1
+
+
+def test_model_runner_returns_block_score_updates_when_sparse_enabled() -> None:
+    runner = ModelRunner(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            sparse_kv_config=SparseKVConfig(mode="dynamic"),
+            device_config=DeviceConfig(device="cpu"),
+        )
+    )
+    hf_config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        tie_word_embeddings=False,
+    )
+    runner.model = Llama3ForCausalLM(
+        KVCoreConfig(
+            model_config=ModelConfig(
+                model="unused",
+                attn_backend="torch_paged",
+                hf_config=hf_config,
+            ),
+            sparse_kv_config=SparseKVConfig(mode="dynamic"),
+            device_config=DeviceConfig(device="cpu"),
+        )
+    )
+    kv_config = make_kv_config()
+    runner.initialize_kv_cache(kv_config)
+    scheduler = Scheduler(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=8),
+            sparse_kv_config=SparseKVConfig(mode="dynamic"),
+            device_config=DeviceConfig(device="cpu"),
+        ),
+        kv_config,
+    )
+    scheduler.add_request(make_request(token_ids=[1, 2, 3, 4]))
+
+    scheduler_output = scheduler.schedule()
+    assert runner.execute_model(scheduler_output) is None
+    model_runner_output = runner.sample_tokens()
+
+    assert model_runner_output.block_score_updates
+    assert {update.layer_idx for update in model_runner_output.block_score_updates} == {0, 1}
+    assert model_runner_output.block_score_updates[0].request_id == "req"

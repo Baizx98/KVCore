@@ -62,6 +62,9 @@ class TorchPagedAttentionBackend:
         key_cache = metadata.kv_cache_tensor[0]
         value_cache = metadata.kv_cache_tensor[1]
         block_table = metadata.block_tables[layer_idx].get_device_tensor(metadata.num_reqs)
+        block_indices = metadata.block_tables[layer_idx].get_block_indices_device_tensor(
+            metadata.num_reqs
+        )
         block_size = key_cache.shape[1]
 
         self._paged_write(
@@ -94,6 +97,7 @@ class TorchPagedAttentionBackend:
                     key_cache=key_cache,
                     value_cache=value_cache,
                     block_table=block_table,
+                    block_indices=block_indices,
                     request_idx=request_idx,
                     query_position=query_position,
                     kv_head_idx=kv_head_idx,
@@ -167,15 +171,31 @@ class TorchPagedAttentionBackend:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
+        block_indices: torch.Tensor,
         request_idx: int,
         query_position: int,
         kv_head_idx: int,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         positions = torch.arange(query_position + 1, device=key_cache.device)
-        block_indices = positions // block_size
+        logical_block_indices = positions // block_size
         block_offsets = positions % block_size
-        block_ids = block_table[request_idx, block_indices].long()
+        read_logical_indices = block_indices[request_idx]
+        read_block_ids = block_table[request_idx]
+        valid_read_blocks = read_logical_indices >= 0
+        read_logical_indices = read_logical_indices[valid_read_blocks]
+        read_block_ids = read_block_ids[valid_read_blocks].long()
+        matches = logical_block_indices[:, None] == read_logical_indices[None, :]
+        visible_positions = matches.any(dim=1)
+        if not bool(visible_positions.any()):
+            return (
+                key_cache.new_zeros((0, key_cache.shape[-1])),
+                value_cache.new_zeros((0, value_cache.shape[-1])),
+            )
+        compact_indices = matches.to(torch.int64).argmax(dim=1)
+        compact_indices = compact_indices[visible_positions]
+        block_ids = read_block_ids.index_select(0, compact_indices)
+        block_offsets = block_offsets[visible_positions]
         keys = key_cache[block_ids, block_offsets, kv_head_idx]
         values = value_cache[block_ids, block_offsets, kv_head_idx]
         return keys, values

@@ -7,6 +7,7 @@ from kvcore.config import (
     LoadConfig,
     ModelConfig,
     SchedulerConfig,
+    SparseKVConfig,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "LoadConfig",
     "ModelConfig",
     "SchedulerConfig",
+    "SparseKVConfig",
 ]

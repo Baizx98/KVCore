@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import ceil
 
 from kvcore.kv.block_pool import BlockPool
 from kvcore.kv.kv_metrics import KVCacheMetricsCollector
@@ -13,6 +14,13 @@ from kvcore.kv.single_type_kv_manager import (
     LayerBlockSelection,
     SingleTypeKVManager,
     get_manager_for_kv_cache_spec,
+)
+from kvcore.kv.sparse import (
+    BlockScoreUpdate,
+    LayerSparsePlan,
+    SparseKVMode,
+    SparseKVPlan,
+    SparseKVSelectionInterval,
 )
 from kvcore.utils.log import get_logger
 from kvcore.utils.request import Request
@@ -106,6 +114,7 @@ class KVManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(len(self.layer_managers)))
         )
+        self.step_id = 0
         logger.info(
             "KVManager initialized num_gpu_blocks=%d max_model_len=%d "
             "num_layers=%d enable_caching=%s",
@@ -273,6 +282,162 @@ class KVManager:
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         return self.get_blocks(request_id).get_block_ids()
 
+    def build_sparse_plan(
+        self,
+        request_id: str,
+        *,
+        context_len: int,
+        num_scheduled_tokens: int,
+        is_prefill: bool,
+        sparse_config: object,
+    ) -> SparseKVPlan:
+        full_block_ids = tuple(tuple(ids) for ids in self.get_block_ids(request_id))
+        if not self._should_apply_sparse(is_prefill, sparse_config):
+            return SparseKVPlan.empty()
+
+        layer_plans: list[LayerSparsePlan] = []
+        total_selected_blocks = 0
+        total_candidate_blocks = 0
+        for manager, layer_block_ids in zip(
+            self.layer_managers,
+            full_block_ids,
+            strict=True,
+        ):
+            keep_indices = self._select_selected_block_indices(
+                manager=manager,
+                request_id=request_id,
+                block_ids=layer_block_ids,
+                context_len=context_len,
+                num_scheduled_tokens=num_scheduled_tokens,
+                sparse_config=sparse_config,
+            )
+            valid_indices = {
+                block_index
+                for block_index, block_id in enumerate(layer_block_ids)
+                if block_id != 0
+            }
+            manager.mark_dynamic_selection(
+                request_id,
+                keep_indices,
+                step_id=self.step_id,
+            )
+            visible_indices = tuple(
+                block_index
+                for block_index in sorted(keep_indices)
+                if block_index < len(layer_block_ids)
+            )
+            total_candidate_blocks += len(valid_indices)
+            total_selected_blocks += len(visible_indices)
+            if set(visible_indices) != valid_indices:
+                layer_plans.append(
+                    LayerSparsePlan(
+                        request_id=request_id,
+                        layer_idx=manager.kv_cache_spec.layer_idx,
+                        selected_block_indices=visible_indices,
+                        is_sparse=True,
+                    )
+                )
+
+        total_full_blocks = sum(len(layer_ids) for layer_ids in full_block_ids)
+        total_skipped_blocks = total_candidate_blocks - total_selected_blocks
+        logger.info(
+            "Sparse KV plan request_id=%s context_len=%d scheduled_tokens=%d "
+            "prefill=%s full_blocks=%d selected_blocks=%d skipped_blocks=%d "
+            "mode=%s compression_ratio=%.3f",
+            request_id,
+            context_len,
+            num_scheduled_tokens,
+            is_prefill,
+            total_full_blocks,
+            total_selected_blocks,
+            total_skipped_blocks,
+            getattr(sparse_config, "mode", None),
+            getattr(sparse_config, "compression_ratio", 0.0),
+        )
+
+        return SparseKVPlan(tuple(layer_plans))
+
+    def update_block_scores(
+        self,
+        updates: Sequence[BlockScoreUpdate],
+        *,
+        ema_alpha: float,
+    ) -> None:
+        score_summaries: dict[tuple[str, int, str], tuple[set[int], int]] = {}
+        for update in updates:
+            if update.layer_idx < 0 or update.layer_idx >= self.num_layers:
+                continue
+            scores = dict(zip(update.logical_block_indices, update.scores, strict=True))
+            if scores:
+                summary_key = (update.request_id, update.step_id, update.score_kind)
+                layers, num_blocks = score_summaries.setdefault(summary_key, (set(), 0))
+                layers.add(update.layer_idx)
+                score_summaries[summary_key] = (layers, num_blocks + len(scores))
+            self.layer_managers[update.layer_idx].update_block_scores(
+                update.request_id,
+                scores,
+                step_id=update.step_id,
+                ema_alpha=ema_alpha,
+            )
+        for (request_id, step_id, score_kind), (
+            layers,
+            num_blocks,
+        ) in score_summaries.items():
+            logger.info(
+                "Sparse KV score update request_id=%s layers=%d blocks=%d "
+                "score_kind=%s step_id=%d",
+                request_id,
+                len(layers),
+                num_blocks,
+                score_kind,
+                step_id,
+            )
+
+    def advance_step(self) -> None:
+        self.step_id += 1
+
+    def evict_unselected_sparse_blocks(
+        self,
+        request_id: str,
+        *,
+        context_len: int,
+        sparse_config: object,
+    ) -> EvictionResult:
+        selections: list[LayerBlockSelection] = []
+        full_block_ids = tuple(tuple(ids) for ids in self.get_block_ids(request_id))
+        for manager, layer_block_ids in zip(
+            self.layer_managers,
+            full_block_ids,
+            strict=True,
+        ):
+            valid_indices = {
+                block_index
+                for block_index, block_id in enumerate(layer_block_ids)
+                if block_id != 0
+            }
+            if not valid_indices:
+                continue
+            selected_indices = self._select_selected_block_indices(
+                manager=manager,
+                request_id=request_id,
+                block_ids=layer_block_ids,
+                context_len=context_len,
+                num_scheduled_tokens=0,
+                sparse_config=sparse_config,
+            )
+            evict_indices = valid_indices - selected_indices
+            if evict_indices:
+                selections.append(
+                    LayerBlockSelection(
+                        request_id=request_id,
+                        layer_idx=manager.kv_cache_spec.layer_idx,
+                        block_indices=evict_indices,
+                    )
+                )
+        if not selections:
+            return EvictionResult(())
+        return self.evict_request_blocks(selections)
+
     def take_new_block_ids(self) -> list[int]:
         block_ids: list[int] = []
         for manager in self.layer_managers:
@@ -340,6 +505,103 @@ class KVManager:
             )
         )
 
+    def _should_apply_sparse(self, is_prefill: bool, sparse_config: object) -> bool:
+        mode = getattr(sparse_config, "mode", SparseKVMode.DISABLED.value)
+        if mode == SparseKVMode.DISABLED.value:
+            return False
+        if is_prefill and not getattr(sparse_config, "enable_prefill_sparsity", False):
+            return False
+        if not is_prefill and not getattr(sparse_config, "enable_decode_sparsity", True):
+            return False
+        interval = getattr(
+            sparse_config,
+            "selection_interval",
+            SparseKVSelectionInterval.STEP.value,
+        )
+        if interval == SparseKVSelectionInterval.STEP.value:
+            return True
+        if interval == SparseKVSelectionInterval.BLOCK.value:
+            block_size = self.layer_managers[0].block_size
+            return self.step_id % block_size == 0
+        if interval == SparseKVSelectionInterval.N_TOKENS.value:
+            interval_tokens = getattr(sparse_config, "selection_interval_tokens", None)
+            return bool(interval_tokens and self.step_id % interval_tokens == 0)
+        return False
+
+    def _select_selected_block_indices(
+        self,
+        *,
+        manager: SingleTypeKVManager,
+        request_id: str,
+        block_ids: tuple[int, ...],
+        context_len: int,
+        num_scheduled_tokens: int,
+        sparse_config: object,
+    ) -> set[int]:
+        valid_indices = {
+            block_index for block_index, block_id in enumerate(block_ids) if block_id != 0
+        }
+        if not valid_indices:
+            return set()
+
+        states = manager.get_sparse_states(request_id)
+        scored_candidates = {
+            block_index
+            for block_index in valid_indices
+            if states.get(block_index) is not None
+            and states[block_index].ema_score is not None
+            and not states[block_index].is_permanently_evicted
+        }
+        if not scored_candidates:
+            return valid_indices
+
+        protected = self._get_protected_block_indices(
+            num_blocks=len(block_ids),
+            context_len=context_len,
+            num_scheduled_tokens=num_scheduled_tokens,
+            block_size=manager.block_size,
+            sparse_config=sparse_config,
+        )
+        keep_budget = max(
+            len(protected & valid_indices),
+            ceil(len(valid_indices) * (1.0 - getattr(sparse_config, "compression_ratio", 0.5))),
+        )
+        if keep_budget >= len(valid_indices):
+            return valid_indices
+
+        keep_indices = set(protected & valid_indices)
+        ranked_candidates = sorted(
+            (block_index for block_index in valid_indices if block_index not in keep_indices),
+            key=lambda block_index: states.get(block_index).ema_score
+            if states.get(block_index) is not None
+            and states[block_index].ema_score is not None
+            else float("inf"),
+            reverse=True,
+        )
+        keep_indices.update(ranked_candidates[: max(0, keep_budget - len(keep_indices))])
+        return keep_indices
+
+    def _get_protected_block_indices(
+        self,
+        *,
+        num_blocks: int,
+        context_len: int,
+        num_scheduled_tokens: int,
+        block_size: int,
+        sparse_config: object,
+    ) -> set[int]:
+        protected: set[int] = set()
+        sink_blocks = min(getattr(sparse_config, "prefix_sink_blocks", 1), num_blocks)
+        protected.update(range(sink_blocks))
+        recent_blocks = min(getattr(sparse_config, "protected_recent_blocks", 2), num_blocks)
+        protected.update(range(max(0, num_blocks - recent_blocks), num_blocks))
+        if num_blocks > 0:
+            current_start = context_len // block_size
+            current_end = (context_len + max(num_scheduled_tokens, 1) - 1) // block_size
+            protected.update(range(current_start, min(current_end + 1, num_blocks)))
+            if (context_len + num_scheduled_tokens) % block_size != 0:
+                protected.add(num_blocks - 1)
+        return protected
 
 __all__ = [
     "KVCacheBlocks",

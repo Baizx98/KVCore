@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import torch
 
-from kvcore.config import KVCoreConfig, ModelConfig, SchedulerConfig
+from kvcore.config import (
+    KVCoreConfig,
+    ModelConfig,
+    SchedulerConfig,
+    SparseKVConfig,
+)
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.kv_metrics import KVCacheMetricsCollector
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
+from kvcore.kv.sparse import BlockScoreUpdate
 from kvcore.sched.scheduler import Scheduler
 from kvcore.utils.request import Request, RequestStatus
 from kvcore.utils.sampling_params import SamplingParams
@@ -79,6 +85,7 @@ def test_scheduler_chunked_prefill_emits_new_request_data() -> None:
     assert output.scheduled_new_reqs[0].num_computed_tokens == 0
     assert output.scheduled_cached_reqs.req_ids == ()
     assert output.new_block_ids_to_zero
+    assert output.sparse_plan.is_empty
 
 
 def test_scheduler_chunked_prefill_continuation_samples_on_last_chunk() -> None:
@@ -189,6 +196,45 @@ def test_scheduler_decode_progression_and_finish() -> None:
     assert final_update.step_outputs[0].sampled_token_id == 10
     assert final_update.step_outputs[0].finished
     assert final_update.finished_requests[0].request_id == "req"
+
+
+def test_scheduler_dynamic_sparse_plan_applies_to_decode_only() -> None:
+    scheduler = Scheduler(
+        KVCoreConfig(
+            model_config=ModelConfig(model="unused", attn_backend="torch_paged"),
+            scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_scheduled_tokens=8),
+            sparse_kv_config=SparseKVConfig(
+                mode="dynamic",
+                compression_ratio=0.5,
+                prefix_sink_blocks=0,
+                protected_recent_blocks=1,
+            ),
+        ),
+        make_kv_config(),
+    )
+    scheduler.add_request(make_request("req", [1, 2, 3, 4, 5, 6], max_tokens=2))
+
+    prefill = scheduler.schedule()
+    assert prefill.sparse_plan.is_empty
+    scheduler.update_from_outputs(
+        prefill,
+        {"req": 9},
+        block_score_updates=(
+            BlockScoreUpdate(
+                request_id="req",
+                layer_idx=0,
+                logical_block_indices=(0, 1, 2),
+                scores=(0.1, 0.9, 0.2),
+                score_kind="test",
+                step_id=0,
+            ),
+        ),
+    )
+
+    decode = scheduler.schedule()
+
+    assert decode.scheduled_cached_reqs.block_ids[0] == ((1, 2, 3, 4),)
+    assert decode.sparse_plan.get_selected_indices("req", 0) == (1, 3)
 
 
 def test_scheduler_finish_requests_clears_waiting_and_running() -> None:

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 
 from kvcore.model.kv_runtime import PagedAttentionMetadata
 
@@ -11,6 +12,7 @@ from kvcore.model.kv_runtime import PagedAttentionMetadata
 @dataclass(frozen=True, slots=True)
 class ForwardContext:
     attn_metadata: PagedAttentionMetadata
+    block_score_collector: Any | None = None
 
 
 _forward_context: ContextVar[ForwardContext | None] = ContextVar(

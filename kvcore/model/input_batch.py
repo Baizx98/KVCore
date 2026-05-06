@@ -100,6 +100,15 @@ class InputBatch:
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
         )
+        self.full_block_table = MultiGroupBlockTable(
+            max_num_reqs=max_num_reqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            pin_memory=self.pin_memory,
+            device=device,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+        )
 
     @property
     def req_ids(self) -> list[str]:
@@ -125,7 +134,7 @@ class InputBatch:
         self._req_ids[req_index] = request.req_id
         self.requests[req_index] = request
         self._write_request_row(req_index, request)
-        self.block_table.add_row(_to_block_table_row(request.block_ids), req_index)
+        self.full_block_table.add_row(_to_block_table_row(request.block_ids), req_index)
         logger.debug(
             "InputBatch added request req_id=%s row=%d prompt_tokens=%d",
             request.req_id,
@@ -161,7 +170,7 @@ class InputBatch:
         request.block_ids = block_ids
         request.num_computed_tokens = num_computed_tokens
         self.num_computed_tokens_cpu[req_index] = num_computed_tokens
-        self.block_table.add_row(_to_block_table_row(block_ids), req_index)
+        self.full_block_table.add_row(_to_block_table_row(block_ids), req_index)
         logger.debug(
             "InputBatch updated cached request req_id=%s row=%d new_tokens=%d "
             "num_computed_tokens=%d",
@@ -200,6 +209,7 @@ class InputBatch:
             if new_index != old_index:
                 self._move_row(old_index, new_index)
                 self.block_table.move_row(old_index, new_index)
+                self.full_block_table.move_row(old_index, new_index)
             self._req_ids[new_index] = request.req_id
             self.requests[new_index] = request
 
@@ -273,6 +283,7 @@ class InputBatch:
         self.num_prompt_tokens[req_index] = 0
         self.num_computed_tokens_cpu[req_index] = 0
         self.block_table.clear_row(req_index)
+        self.full_block_table.clear_row(req_index)
 
     def _check_token_capacity(self, req_id: str, num_tokens: int) -> None:
         if num_tokens > self.max_model_len:

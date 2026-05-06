@@ -34,6 +34,24 @@ def test_block_table_row_ops_and_commit() -> None:
     assert table.get_device_tensor(num_reqs=3).shape == (3, 4)
 
 
+def test_block_table_tracks_logical_block_indices() -> None:
+    table = BlockTable(
+        block_size=2,
+        max_num_reqs=1,
+        max_num_blocks_per_req=4,
+        max_num_batched_tokens=8,
+        pin_memory=False,
+        device=torch.device("cpu"),
+    )
+
+    table.add_row([3, 7], row_idx=0, block_indices=[0, 3])
+    table.commit_block_table(num_reqs=1)
+
+    assert table.get_device_tensor(num_reqs=1)[0, :2].tolist() == [3, 7]
+    assert table.get_block_indices_device_tensor(num_reqs=1)[0, :2].tolist() == [0, 3]
+    assert table.get_num_blocks_device_tensor(num_reqs=1).tolist() == [2]
+
+
 def test_block_table_hybrid_kernel_block_mapping() -> None:
     mapped = BlockTable.map_to_kernel_blocks(
         np.array([0, 2], dtype=np.int32),

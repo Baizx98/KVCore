@@ -77,7 +77,10 @@ class Attention(nn.Module):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
-        attn_metadata = get_forward_context().attn_metadata
+        forward_context = get_forward_context()
+        if forward_context.block_score_collector is not None:
+            forward_context.block_score_collector.record_query(self.layer_idx, query)
+        attn_metadata = forward_context.attn_metadata
         output_view = self.backend_impl.forward(
             query,
             key,

@@ -67,6 +67,61 @@ def make_metadata(
     )
 
 
+def make_sparse_decode_metadata(
+    *,
+    kv_cache_tensor: torch.Tensor,
+    full_block_ids: list[int],
+    read_block_ids: list[int],
+    read_block_indices: list[int],
+    position: int,
+    block_size: int = 2,
+) -> PagedAttentionMetadata:
+    device = kv_cache_tensor.device
+    read_tables = MultiGroupBlockTable(
+        max_num_reqs=1,
+        max_model_len=32,
+        max_num_batched_tokens=1,
+        pin_memory=False,
+        device=device,
+        block_sizes=[block_size],
+        kernel_block_sizes=[block_size],
+    )
+    full_tables = MultiGroupBlockTable(
+        max_num_reqs=1,
+        max_model_len=32,
+        max_num_batched_tokens=1,
+        pin_memory=False,
+        device=device,
+        block_sizes=[block_size],
+        kernel_block_sizes=[block_size],
+    )
+    read_tables.add_row((read_block_ids,), 0, (read_block_indices,))
+    read_tables.commit_block_table(1)
+    full_tables.add_row((full_block_ids,), 0)
+
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    flat_positions_tensor = torch.tensor([position], dtype=torch.int32, device=device)
+    full_tables[0].compute_slot_mapping(1, query_start_loc, flat_positions_tensor)
+
+    return PagedAttentionMetadata(
+        kv_cache_tensor=kv_cache_tensor,
+        block_tables=read_tables,
+        slot_mapping={0: full_tables[0].slot_mapping.gpu[:1]},
+        query_start_loc=query_start_loc,
+        seq_lens=torch.tensor([position + 1], dtype=torch.int32, device=device),
+        context_lens=torch.tensor([position], dtype=torch.int32, device=device),
+        query_lens=torch.tensor([1], dtype=torch.int32, device=device),
+        flat_positions=flat_positions_tensor,
+        token_request_indices=torch.zeros(1, dtype=torch.int32, device=device),
+        num_reqs=1,
+        num_scheduled_tokens=1,
+        num_prefill_reqs=0,
+        num_decode_reqs=1,
+        max_query_len=1,
+        max_seq_len=position + 1,
+    )
+
+
 def dense_flattened_reference(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -206,5 +261,50 @@ def test_torch_paged_attention_reads_previous_decode_cache() -> None:
     ) * (8**-0.5)
     probs = torch.softmax(scores, dim=-1)
     reference = torch.matmul(probs, all_value.to(torch.float32))
+
+    assert torch.allclose(output, reference, atol=1e-5, rtol=1e-5)
+
+
+def test_torch_paged_attention_sparse_read_skips_hidden_blocks() -> None:
+    torch.manual_seed(0)
+    backend = TorchPagedAttentionBackend()
+    kv_cache_tensor = torch.zeros((2, 16, 2, 1, 8), dtype=torch.float32)
+    key_cache = kv_cache_tensor[0]
+    value_cache = kv_cache_tensor[1]
+    key_cache[1, 0:2, 0] = torch.randn((2, 8))
+    key_cache[2, 0:2, 0] = torch.randn((2, 8))
+    value_cache[1, 0:2, 0] = torch.randn((2, 8))
+    value_cache[2, 0:2, 0] = torch.randn((2, 8))
+
+    decode_query = torch.randn((1, 1, 1, 8))
+    decode_key = torch.randn((1, 1, 1, 8))
+    decode_value = torch.randn((1, 1, 1, 8))
+    metadata = make_sparse_decode_metadata(
+        kv_cache_tensor=kv_cache_tensor,
+        full_block_ids=[1, 2, 3],
+        read_block_ids=[1, 3],
+        read_block_indices=[0, 2],
+        position=4,
+    )
+
+    output = backend.forward(
+        decode_query,
+        decode_key,
+        decode_value,
+        num_kv_heads=1,
+        scaling=8**-0.5,
+        is_causal=True,
+        attn_metadata=metadata,
+        layer_idx=0,
+    )
+
+    visible_keys = torch.cat([key_cache[1, 0:2, 0], decode_key[0, 0]], dim=0)
+    visible_values = torch.cat([value_cache[1, 0:2, 0], decode_value[0, 0]], dim=0)
+    scores = torch.matmul(
+        visible_keys.to(torch.float32),
+        decode_query[0, 0, 0].to(torch.float32),
+    ) * (8**-0.5)
+    probs = torch.softmax(scores, dim=0)
+    reference = torch.matmul(probs, visible_values.to(torch.float32)).view(1, 1, 1, 8)
 
     assert torch.allclose(output, reference, atol=1e-5, rtol=1e-5)

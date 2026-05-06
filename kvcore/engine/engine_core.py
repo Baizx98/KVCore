@@ -129,6 +129,7 @@ class EngineCore:
             scheduler_output,
             sampled_token_map,
             stop_token_ids=self.stop_token_ids,
+            block_score_updates=model_runner_output.block_score_updates,
         )
         for finished_request in update_result.finished_requests:
             self.finished_outputs[finished_request.request_id] = FinishedRequestOutput(

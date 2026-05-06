@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kvcore.kv.sparse import SparseKVPlan
 from kvcore.utils.request import FinishReason
 from kvcore.utils.sampling_params import SamplingParams
 
@@ -51,8 +52,10 @@ class SchedulerOutput:
     scheduled_cached_reqs: CachedRequestData
     num_scheduled_tokens: dict[str, int]
     total_num_scheduled_tokens: int
+    sparse_plan: SparseKVPlan = SparseKVPlan()
     finished_req_ids: frozenset[str] = frozenset()
     new_block_ids_to_zero: tuple[int, ...] = ()
+    step_id: int = 0
 
     @property
     def is_empty(self) -> bool:
@@ -65,8 +68,10 @@ class SchedulerOutput:
             scheduled_cached_reqs=CachedRequestData.empty(),
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
+            sparse_plan=SparseKVPlan.empty(),
             finished_req_ids=frozenset(),
             new_block_ids_to_zero=(),
+            step_id=0,
         )
 
 

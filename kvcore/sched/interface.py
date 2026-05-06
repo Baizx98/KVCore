@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 
+from kvcore.kv.sparse import BlockScoreUpdate
 from kvcore.sched.utils import FinishedRequestState, SchedulerOutput, SchedulerUpdateResult
 from kvcore.utils.request import Request, RequestStatus
 
@@ -19,6 +20,7 @@ class SchedulerInterface(ABC):
         sampled_token_ids: Mapping[str, int],
         *,
         stop_token_ids: set[int] | None = None,
+        block_score_updates: tuple[BlockScoreUpdate, ...] = (),
     ) -> SchedulerUpdateResult:
         raise NotImplementedError
 

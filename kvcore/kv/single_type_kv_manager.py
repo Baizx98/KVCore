@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from kvcore.kv.block_pool import BlockPool
 from kvcore.kv.kv_utils import KVBlock
+from kvcore.kv.sparse import BlockSparseState
 from kvcore.utils.request import Request
 
 
@@ -95,6 +96,9 @@ class SingleTypeKVManager(ABC):
         self.req_to_blocks: defaultdict[str, list[KVBlock]] = defaultdict(list)
         self.num_cached_blocks: dict[str, int] = {}
         self.permanently_evicted_blocks: defaultdict[str, set[int]] = defaultdict(set)
+        self.block_sparse_states: defaultdict[str, dict[int, BlockSparseState]] = (
+            defaultdict(dict)
+        )
         self._null_block = self.block_pool.null_block
 
     def get_num_blocks_to_allocate(
@@ -122,6 +126,7 @@ class SingleTypeKVManager(ABC):
             self.block_pool.touch(new_computed_blocks)
         self.req_to_blocks[request_id].extend(new_computed_blocks)
         self.num_cached_blocks[request_id] = len(self.req_to_blocks[request_id])
+        self._sync_sparse_states(request_id)
 
     def allocate_new_blocks(self, request_id: str, num_tokens: int) -> list[KVBlock]:
         req_blocks = self.req_to_blocks[request_id]
@@ -132,6 +137,7 @@ class SingleTypeKVManager(ABC):
         new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(new_blocks)
         self.new_block_ids.extend(block.block_id for block in new_blocks)
+        self._sync_sparse_states(request_id)
         return new_blocks
 
     def take_new_block_ids(self) -> list[int]:
@@ -173,6 +179,7 @@ class SingleTypeKVManager(ABC):
         self.block_pool.free_blocks(reversed(req_blocks))
         self.num_cached_blocks.pop(request_id, None)
         self.permanently_evicted_blocks.pop(request_id, None)
+        self.block_sparse_states.pop(request_id, None)
 
     def evict_blocks(self, request_id: str, block_indices: set[int]) -> LayerEvictionResult:
         blocks = self.req_to_blocks.get(request_id)
@@ -196,11 +203,13 @@ class SingleTypeKVManager(ABC):
             block = blocks[block_index]
             if block.is_null:
                 permanent_set.add(block_index)
+                self._mark_permanently_evicted(request_id, block_index)
                 skipped_indices.append(block_index)
                 continue
 
             blocks[block_index] = self._null_block
             permanent_set.add(block_index)
+            self._mark_permanently_evicted(request_id, block_index)
             evicted_indices.append(block_index)
             evicted_block_ids.append(block.block_id)
             blocks_to_free.append(block)
@@ -216,6 +225,74 @@ class SingleTypeKVManager(ABC):
             evicted_block_ids=tuple(evicted_block_ids),
             skipped_block_indices=tuple(skipped_indices),
         )
+
+    def get_sparse_states(self, request_id: str) -> dict[int, BlockSparseState]:
+        self._sync_sparse_states(request_id)
+        return self.block_sparse_states.get(request_id, {})
+
+    def update_block_scores(
+        self,
+        request_id: str,
+        block_scores: dict[int, float],
+        *,
+        step_id: int,
+        ema_alpha: float,
+    ) -> None:
+        self._sync_sparse_states(request_id)
+        states = self.block_sparse_states.get(request_id, {})
+        for block_index, score in block_scores.items():
+            state = states.get(block_index)
+            if state is None or state.is_permanently_evicted:
+                continue
+            previous = state.ema_score
+            state.score = score
+            state.ema_score = (
+                score if previous is None else ema_alpha * previous + (1.0 - ema_alpha) * score
+            )
+            state.last_scored_step = step_id
+
+    def mark_dynamic_selection(
+        self,
+        request_id: str,
+        keep_indices: set[int],
+        *,
+        step_id: int,
+    ) -> None:
+        self._sync_sparse_states(request_id)
+        for block_index, state in self.block_sparse_states.get(request_id, {}).items():
+            if state.is_permanently_evicted:
+                continue
+            state.was_dynamic_skipped = block_index not in keep_indices
+            state.last_selected_step = step_id
+
+    def _sync_sparse_states(self, request_id: str) -> None:
+        blocks = self.req_to_blocks.get(request_id, [])
+        states = self.block_sparse_states[request_id]
+        evicted = self.permanently_evicted_blocks.get(request_id, set())
+        for block_index, block in enumerate(blocks):
+            state = states.get(block_index)
+            if state is None:
+                states[block_index] = BlockSparseState(
+                    request_id=request_id,
+                    layer_idx=self.kv_cache_spec.layer_idx,
+                    logical_block_idx=block_index,
+                    physical_block_id=block.block_id,
+                    is_permanently_evicted=block_index in evicted or block.is_null,
+                )
+                continue
+            state.physical_block_id = block.block_id
+            state.is_permanently_evicted = block_index in evicted or block.is_null
+        for block_index in tuple(states):
+            if block_index >= len(blocks):
+                states.pop(block_index, None)
+
+    def _mark_permanently_evicted(self, request_id: str, block_index: int) -> None:
+        self._sync_sparse_states(request_id)
+        state = self.block_sparse_states[request_id].get(block_index)
+        if state is None:
+            return
+        state.is_permanently_evicted = True
+        state.physical_block_id = self._null_block.block_id
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks.get(running_request_id, [])

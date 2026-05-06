@@ -17,6 +17,7 @@ from kvcore.config import (
     LoadConfig,
     ModelConfig,
     SchedulerConfig,
+    SparseKVConfig,
 )
 from kvcore.entry.llm_engine import GenerationRequest, LLMEngine
 from kvcore.utils.log import configure_logging
@@ -144,6 +145,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-partial-prefills", type=int, default=128)
     parser.add_argument("--max-long-partial-prefills", type=int, default=128)
     parser.add_argument("--long-prefill-token-threshold", type=int, default=0)
+    parser.add_argument("--sparse-kv-mode", default="disabled")
+    parser.add_argument("--sparse-kv-selection-interval", default="step")
+    parser.add_argument("--sparse-kv-selection-interval-tokens", type=int, default=None)
+    parser.add_argument("--sparse-kv-compression-ratio", type=float, default=0.2)
+    parser.add_argument("--sparse-kv-q-window-size", type=int, default=32)
+    parser.add_argument("--sparse-kv-prefix-sink-blocks", type=int, default=1)
+    parser.add_argument("--sparse-kv-protected-recent-blocks", type=int, default=2)
+    parser.add_argument("--sparse-kv-score-ema-alpha", type=float, default=0.8)
+    parser.add_argument("--sparse-kv-summary-topk-keys", type=int, default=4)
+    parser.add_argument("--sparse-kv-mean-key-weight", type=float, default=0.75)
+    parser.add_argument(
+        "--sparse-kv-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--sparse-kv-decode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--log-file",
@@ -169,6 +190,16 @@ def main() -> None:
         print(f"local_files_only={args.local_files_only}")
         print(f"max_num_seqs={args.max_num_seqs}")
         print(f"max_num_scheduled_tokens={args.max_num_scheduled_tokens}")
+        print(f"sparse_kv_mode={args.sparse_kv_mode}")
+        print(f"sparse_kv_selection_interval={args.sparse_kv_selection_interval}")
+        print(
+            "sparse_kv_selection_interval_tokens="
+            f"{args.sparse_kv_selection_interval_tokens}"
+        )
+        print(f"sparse_kv_compression_ratio={args.sparse_kv_compression_ratio}")
+        print(f"sparse_kv_q_window_size={args.sparse_kv_q_window_size}")
+        print(f"sparse_kv_prefill={args.sparse_kv_prefill}")
+        print(f"sparse_kv_decode={args.sparse_kv_decode}")
 
         requests = build_generation_requests(OFFLINE_REQUESTS)
         if not requests:
@@ -221,6 +252,20 @@ def build_config(args: argparse.Namespace) -> KVCoreConfig:
             max_num_partial_prefills=args.max_num_partial_prefills,
             max_long_partial_prefills=args.max_long_partial_prefills,
             long_prefill_token_threshold=args.long_prefill_token_threshold,
+        ),
+        sparse_kv_config=SparseKVConfig(
+            mode=args.sparse_kv_mode,
+            selection_interval=args.sparse_kv_selection_interval,
+            selection_interval_tokens=args.sparse_kv_selection_interval_tokens,
+            compression_ratio=args.sparse_kv_compression_ratio,
+            q_window_size=args.sparse_kv_q_window_size,
+            prefix_sink_blocks=args.sparse_kv_prefix_sink_blocks,
+            protected_recent_blocks=args.sparse_kv_protected_recent_blocks,
+            score_ema_alpha=args.sparse_kv_score_ema_alpha,
+            summary_topk_keys=args.sparse_kv_summary_topk_keys,
+            mean_key_weight=args.sparse_kv_mean_key_weight,
+            enable_prefill_sparsity=args.sparse_kv_prefill,
+            enable_decode_sparsity=args.sparse_kv_decode,
         ),
         device_config=DeviceConfig(device=args.device),
     )

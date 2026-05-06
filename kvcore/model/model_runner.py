@@ -10,6 +10,8 @@ from torch import nn
 from kvcore.config import KVCoreConfig
 from kvcore.kv.kv_manager import KVManagerConfig
 from kvcore.kv.single_type_kv_manager import KVLayerSpec
+from kvcore.kv.sparse import BlockScoreUpdate
+from kvcore.model.block_score import BlockScoreCollector
 from kvcore.model.forward_context import ForwardContext, set_forward_context
 from kvcore.model.input_batch import CachedRequestState, InputBatch
 from kvcore.model.kv_runtime import PagedAttentionMetadata
@@ -50,10 +52,11 @@ class ModelRunnerOutput:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     sampled_token_ids: list[list[int]]
+    block_score_updates: tuple[BlockScoreUpdate, ...] = ()
 
     @classmethod
     def empty(cls) -> ModelRunnerOutput:
-        return cls(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+        return cls(req_ids=[], req_id_to_index={}, sampled_token_ids=[], block_score_updates=())
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,7 @@ class ExecuteModelState:
     metadata_time_sec: float
     forward_time_sec: float
     num_zeroed_blocks: int
+    block_score_updates: tuple[BlockScoreUpdate, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +103,7 @@ class ModelRunner:
         self.input_batch: InputBatch | None = None
         self.requests: dict[str, CachedRequestState] = {}
         self.sampler = Sampler()
+        self.block_score_collector = BlockScoreCollector(kvcore_config.sparse_kv_config)
         self.execute_model_state: ExecuteModelState | None = None
         self.last_step_stats: ModelRunnerStepStats | None = None
 
@@ -236,6 +241,7 @@ class ModelRunner:
 
         metadata_start = perf_counter()
         attn_metadata = self._build_attention_metadata(
+            scheduler_output=scheduler_output,
             num_reqs=len(req_ids),
             num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
             num_prefill_reqs=num_prefill_reqs,
@@ -246,11 +252,24 @@ class ModelRunner:
         metadata_time = perf_counter() - metadata_start
 
         forward_start = perf_counter()
+        self.block_score_collector.begin_step()
         hidden_states = self._run_forward(
             attn_metadata,
             scheduler_output.total_num_scheduled_tokens,
         )
         forward_time = perf_counter() - forward_start
+        block_score_updates = self.block_score_collector.collect(
+            req_ids=list(req_ids),
+            scheduler_output=scheduler_output,
+            attn_metadata=attn_metadata,
+        )
+        if block_score_updates:
+            logger.info(
+                "ModelRunner sparse score feedback updates=%d reqs=%d tokens=%d",
+                len(block_score_updates),
+                len(req_ids),
+                scheduler_output.total_num_scheduled_tokens,
+            )
 
         logits = self._compute_logits(hidden_states, logits_indices)
         self.execute_model_state = ExecuteModelState(
@@ -268,6 +287,7 @@ class ModelRunner:
             metadata_time_sec=metadata_time,
             forward_time_sec=forward_time,
             num_zeroed_blocks=num_zeroed_blocks,
+            block_score_updates=block_score_updates,
         )
         logger.info(
             "ModelRunner forward reqs=%d tokens=%d prefill=%d decode=%d "
@@ -329,11 +349,13 @@ class ModelRunner:
                 [sampled_by_req_id[req_id]] if req_id in sampled_by_req_id else []
                 for req_id in state.req_ids
             ],
+            block_score_updates=state.block_score_updates,
         )
 
     def remove_requests(self, request_ids: tuple[str, ...] | list[str]) -> None:
         for request_id in request_ids:
             self.requests.pop(request_id, None)
+        self.block_score_collector.clear_requests(request_ids)
         self._require_input_batch().remove_requests(request_ids)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -508,6 +530,7 @@ class ModelRunner:
     def _build_attention_metadata(
         self,
         *,
+        scheduler_output: SchedulerOutput,
         num_reqs: int,
         num_scheduled_tokens: int,
         num_prefill_reqs: int,
@@ -525,15 +548,18 @@ class ModelRunner:
         assert self.query_lens is not None
         assert self.token_request_indices is not None
 
+        self._materialize_read_block_table(scheduler_output)
         input_batch.block_table.commit_block_table(num_reqs)
-        input_batch.block_table.compute_slot_mapping(
+        input_batch.full_block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc[: num_reqs + 1],
             self.positions[:num_scheduled_tokens].to(dtype=torch.int32),
         )
         slot_mapping = {
             layer_idx: block_table.slot_mapping.gpu[:num_scheduled_tokens]
-            for layer_idx, block_table in enumerate(input_batch.block_table.block_tables)
+            for layer_idx, block_table in enumerate(
+                input_batch.full_block_table.block_tables
+            )
         }
         return PagedAttentionMetadata(
             kv_cache_tensor=kv_cache_tensor,
@@ -553,6 +579,41 @@ class ModelRunner:
             max_seq_len=max_seq_len,
         )
 
+    def _materialize_read_block_table(self, scheduler_output: SchedulerOutput) -> None:
+        input_batch = self._require_input_batch()
+        for req_id in input_batch.req_ids:
+            row_idx = input_batch.req_id_to_index[req_id]
+            request = input_batch.get_request(req_id)
+            read_block_ids: list[list[int]] = []
+            read_block_indices: list[list[int]] = []
+            for layer_idx, layer_block_ids in enumerate(request.block_ids):
+                selected = scheduler_output.sparse_plan.get_selected_indices(
+                    req_id,
+                    layer_idx,
+                )
+                if selected is None:
+                    selected_indices = tuple(
+                        block_index
+                        for block_index, block_id in enumerate(layer_block_ids)
+                        if block_id != 0
+                    )
+                else:
+                    selected_indices = tuple(
+                        block_index
+                        for block_index in selected
+                        if block_index < len(layer_block_ids)
+                        and layer_block_ids[block_index] != 0
+                    )
+                read_block_indices.append(list(selected_indices))
+                read_block_ids.append(
+                    [int(layer_block_ids[block_index]) for block_index in selected_indices]
+                )
+            input_batch.block_table.add_row(
+                tuple(read_block_ids),
+                row_idx,
+                tuple(read_block_indices),
+            )
+
     def _run_forward(
         self,
         attn_metadata: PagedAttentionMetadata,
@@ -561,7 +622,12 @@ class ModelRunner:
         model = self._require_model()
         assert self.input_ids is not None
         assert self.positions is not None
-        with set_forward_context(ForwardContext(attn_metadata=attn_metadata)):
+        with set_forward_context(
+            ForwardContext(
+                attn_metadata=attn_metadata,
+                block_score_collector=self.block_score_collector,
+            )
+        ):
             return model(
                 input_ids=self.input_ids[:num_scheduled_tokens],
                 positions=self.positions[:num_scheduled_tokens],
@@ -764,6 +830,7 @@ class ModelRunner:
         self.token_request_indices[:profile_tokens] = 0
 
         attn_metadata = self._build_attention_metadata(
+            scheduler_output=SchedulerOutput.empty(),
             num_reqs=1,
             num_scheduled_tokens=profile_tokens,
             num_prefill_reqs=1,

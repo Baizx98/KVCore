@@ -12,6 +12,7 @@ from kvcore.kv.compression import (
 from kvcore.kv.kv_manager import KVCacheBlocks, KVManager, KVManagerConfig
 from kvcore.kv.kv_metrics import KVCacheMetricsCollector
 from kvcore.kv.kv_utils import get_request_block_hasher
+from kvcore.kv.sparse import BlockScoreUpdate, LayerSparsePlan, SparseKVMode, SparseKVPlan
 from kvcore.sched.interface import SchedulerInterface
 from kvcore.sched.request_queue import RequestQueue
 from kvcore.sched.utils import (
@@ -161,6 +162,7 @@ class Scheduler(SchedulerInterface):
         cached_num_computed_tokens: list[int] = []
         cached_num_output_tokens: list[int] = []
         num_scheduled_tokens: dict[str, int] = {}
+        sparse_layer_plans: list[LayerSparsePlan] = []
         num_partial_prefills = 0
         num_long_partial_prefills = 0
 
@@ -185,6 +187,7 @@ class Scheduler(SchedulerInterface):
                 cached_num_computed_tokens=cached_num_computed_tokens,
                 cached_num_output_tokens=cached_num_output_tokens,
                 num_scheduled_tokens=num_scheduled_tokens,
+                sparse_layer_plans=sparse_layer_plans,
                 num_partial_prefills=num_partial_prefills,
                 num_long_partial_prefills=num_long_partial_prefills,
                 from_waiting=False,
@@ -225,6 +228,7 @@ class Scheduler(SchedulerInterface):
                 cached_num_computed_tokens=cached_num_computed_tokens,
                 cached_num_output_tokens=cached_num_output_tokens,
                 num_scheduled_tokens=num_scheduled_tokens,
+                sparse_layer_plans=sparse_layer_plans,
                 num_partial_prefills=num_partial_prefills,
                 num_long_partial_prefills=num_long_partial_prefills,
                 from_waiting=True,
@@ -291,8 +295,10 @@ class Scheduler(SchedulerInterface):
             ),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            sparse_plan=SparseKVPlan(tuple(sparse_layer_plans)),
             finished_req_ids=finished_req_ids,
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_id=self.kv_manager.step_id,
         )
 
     def compress_kv_cache(
@@ -330,14 +336,37 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids: Mapping[str, int],
         *,
         stop_token_ids: set[int] | None = None,
+        block_score_updates: tuple[BlockScoreUpdate, ...] = (),
     ) -> SchedulerUpdateResult:
         step_outputs: list[RequestStepOutput] = []
         finished_requests: list[FinishedRequestState] = []
 
+        if block_score_updates:
+            self.kv_manager.update_block_scores(
+                block_score_updates,
+                ema_alpha=self.kvcore_config.sparse_kv_config.score_ema_alpha,
+            )
+
         for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             request = self.requests[request_id]
+            previous_num_computed_tokens = request.num_computed_tokens
             request.num_computed_tokens += num_tokens
             self.kv_manager.cache_blocks(request, request.num_computed_tokens)
+            if self._should_evict_after_prefill(
+                request,
+                previous_num_computed_tokens,
+            ):
+                evicted = self.kv_manager.evict_unselected_sparse_blocks(
+                    request.request_id,
+                    context_len=request.num_computed_tokens,
+                    sparse_config=self.kvcore_config.sparse_kv_config,
+                )
+                if evicted.evicted_block_ids:
+                    logger.info(
+                        "Sparse KV permanent prefill eviction request_id=%s blocks=%d",
+                        request.request_id,
+                        len(evicted.evicted_block_ids),
+                    )
             sampled_token_id: int | None = None
             finished = False
             finish_reason: FinishReason | None = None
@@ -380,6 +409,7 @@ class Scheduler(SchedulerInterface):
                 )
             )
 
+        self.kv_manager.advance_step()
         return SchedulerUpdateResult(
             step_outputs=tuple(step_outputs),
             finished_requests=tuple(finished_requests),
@@ -398,6 +428,7 @@ class Scheduler(SchedulerInterface):
         cached_num_computed_tokens: list[int],
         cached_num_output_tokens: list[int],
         num_scheduled_tokens: dict[str, int],
+        sparse_layer_plans: list[LayerSparsePlan],
         num_partial_prefills: int,
         num_long_partial_prefills: int,
         from_waiting: bool,
@@ -456,6 +487,14 @@ class Scheduler(SchedulerInterface):
             tuple(layer_block_ids)
             for layer_block_ids in self.kv_manager.get_block_ids(request.request_id)
         )
+        sparse_plan = self.kv_manager.build_sparse_plan(
+            request.request_id,
+            context_len=context_len,
+            num_scheduled_tokens=num_tokens,
+            is_prefill=is_prefill,
+            sparse_config=self.kvcore_config.sparse_kv_config,
+        )
+        sparse_layer_plans.extend(sparse_plan.layer_plans)
         if from_waiting:
             scheduled_new_reqs.append(
                 NewRequestData(
@@ -502,6 +541,19 @@ class Scheduler(SchedulerInterface):
     @staticmethod
     def _is_prefill(request: Request) -> bool:
         return request.num_computed_tokens < request.num_prompt_tokens
+
+    def _should_evict_after_prefill(
+        self,
+        request: Request,
+        previous_num_computed_tokens: int,
+    ) -> bool:
+        sparse_config = self.kvcore_config.sparse_kv_config
+        if sparse_config.mode != SparseKVMode.PERMANENT.value:
+            return False
+        return (
+            previous_num_computed_tokens < request.num_prompt_tokens
+            and request.num_computed_tokens >= request.num_prompt_tokens
+        )
 
     @staticmethod
     def _get_num_new_tokens_to_schedule(request: Request) -> int:

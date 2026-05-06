@@ -94,6 +94,8 @@ if triton is not None:
         key_cache_ptr,
         value_cache_ptr,
         block_table_ptr,
+        block_indices_ptr,
+        num_blocks_ptr,
         token_request_indices_ptr,
         flat_positions_ptr,
         scale,
@@ -101,6 +103,7 @@ if triton is not None:
         num_query_heads,
         num_queries_per_kv,
         block_table_stride,
+        block_indices_stride,
         stride_qt,
         stride_qh,
         stride_qd,
@@ -139,20 +142,23 @@ if triton is not None:
         l_i = 0.0
         acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
 
-        start = 0
-        while start <= query_position:
-            seq_positions = start + tl.arange(0, BLOCK_N)
-            seq_mask = seq_positions <= query_position
-
-            logical_block_indices = seq_positions // BLOCK_SIZE
-            block_ids = tl.load(
-                block_table_ptr + request_idx * block_table_stride + logical_block_indices,
-                mask=seq_mask,
-                other=0,
+        num_read_blocks = tl.load(num_blocks_ptr + request_idx)
+        read_idx = 0
+        while read_idx < num_read_blocks:
+            logical_block_index = tl.load(
+                block_indices_ptr + request_idx * block_indices_stride + read_idx
             )
-            block_offsets = seq_positions % BLOCK_SIZE
+            block_id = tl.load(block_table_ptr + request_idx * block_table_stride + read_idx)
+            block_offsets = tl.arange(0, BLOCK_N)
+            seq_positions = logical_block_index * BLOCK_SIZE + block_offsets
+            seq_mask = (
+                (block_offsets < BLOCK_SIZE)
+                & (logical_block_index >= 0)
+                & (block_id != 0)
+                & (seq_positions <= query_position)
+            )
             cache_ptrs = (
-                block_ids[:, None] * stride_cb
+                block_id * stride_cb
                 + block_offsets[:, None] * stride_cs
                 + kv_head_idx * stride_ch
                 + offs_d[None, :] * stride_cd
@@ -178,7 +184,7 @@ if triton is not None:
             acc = acc * alpha + tl.sum(value * p[:, None], axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
-            start += BLOCK_N
+            read_idx += 1
 
         output = acc / tl.maximum(l_i, 1e-20)
         output_ptrs = (
@@ -239,6 +245,12 @@ class TritonPagedAttentionBackend:
         value_cache = metadata.kv_cache_tensor[1]
         slot_mapping = metadata.slot_mapping[layer_idx][:num_tokens]
         block_table = metadata.block_tables[layer_idx].get_device_tensor(metadata.num_reqs)
+        block_indices = metadata.block_tables[layer_idx].get_block_indices_device_tensor(
+            metadata.num_reqs
+        )
+        num_blocks = metadata.block_tables[layer_idx].get_num_blocks_device_tensor(
+            metadata.num_reqs
+        )
         if output is None:
             output_states = torch.empty_like(query_states)
         else:
@@ -270,6 +282,8 @@ class TritonPagedAttentionBackend:
             key_cache,
             value_cache,
             block_table,
+            block_indices,
+            num_blocks,
             metadata.token_request_indices,
             metadata.flat_positions,
             scaling,
@@ -352,6 +366,8 @@ class TritonPagedAttentionBackend:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
+        block_indices: torch.Tensor,
+        num_blocks: torch.Tensor,
         token_request_indices: torch.Tensor,
         flat_positions: torch.Tensor,
         scaling: float,
@@ -361,13 +377,15 @@ class TritonPagedAttentionBackend:
         num_queries_per_kv: int,
     ) -> None:
         grid = (query_states.shape[0], query_states.shape[1])
-        block_n = 16 if flat_positions.numel() <= 512 else 32
+        block_n = triton.next_power_of_2(block_size)
         _paged_attention_kernel[grid](
             query_states,
             output,
             key_cache,
             value_cache,
             block_table,
+            block_indices,
+            num_blocks,
             token_request_indices,
             flat_positions,
             scaling,
@@ -375,6 +393,7 @@ class TritonPagedAttentionBackend:
             query_states.shape[1],
             num_queries_per_kv,
             block_table.stride(0),
+            block_indices.stride(0),
             query_states.stride(0),
             query_states.stride(1),
             query_states.stride(2),

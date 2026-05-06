@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from kvcore.kv.sparse import SparseKVMode, SparseKVSelectionInterval
+
 if TYPE_CHECKING:
     from transformers.configuration_utils import PretrainedConfig
 
@@ -92,6 +94,70 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SparseKVConfig:
+    mode: str = SparseKVMode.DISABLED.value
+    selection_interval: str = SparseKVSelectionInterval.STEP.value
+    selection_interval_tokens: int | None = None
+    compression_ratio: float = 0.5
+    q_window_size: int = 32
+    prefix_sink_blocks: int = 1
+    protected_recent_blocks: int = 2
+    score_ema_alpha: float = 0.8
+    summary_topk_keys: int = 4
+    mean_key_weight: float = 0.75
+    enable_prefill_sparsity: bool = False
+    enable_decode_sparsity: bool = True
+
+    def __post_init__(self) -> None:
+        valid_modes = {mode.value for mode in SparseKVMode}
+        if self.mode not in valid_modes:
+            raise ValueError(f"sparse KV mode must be one of {valid_modes}, got {self.mode}")
+        valid_intervals = {interval.value for interval in SparseKVSelectionInterval}
+        if self.selection_interval not in valid_intervals:
+            raise ValueError(
+                "sparse KV selection_interval must be one of "
+                f"{valid_intervals}, got {self.selection_interval}"
+            )
+        if self.selection_interval == SparseKVSelectionInterval.N_TOKENS.value:
+            if self.selection_interval_tokens is None or self.selection_interval_tokens <= 0:
+                raise ValueError(
+                    "selection_interval_tokens must be positive when "
+                    "selection_interval is n_tokens"
+                )
+        if not 0 <= self.compression_ratio < 1:
+            raise ValueError(
+                f"compression_ratio must be in [0, 1), got {self.compression_ratio}"
+            )
+        if self.q_window_size <= 0:
+            raise ValueError(f"q_window_size must be positive, got {self.q_window_size}")
+        if self.prefix_sink_blocks < 0:
+            raise ValueError(
+                f"prefix_sink_blocks must be non-negative, got {self.prefix_sink_blocks}"
+            )
+        if self.protected_recent_blocks < 0:
+            raise ValueError(
+                "protected_recent_blocks must be non-negative, "
+                f"got {self.protected_recent_blocks}"
+            )
+        if not 0 <= self.score_ema_alpha <= 1:
+            raise ValueError(
+                f"score_ema_alpha must be in [0, 1], got {self.score_ema_alpha}"
+            )
+        if self.summary_topk_keys <= 0:
+            raise ValueError(
+                f"summary_topk_keys must be positive, got {self.summary_topk_keys}"
+            )
+        if not 0 <= self.mean_key_weight <= 1:
+            raise ValueError(
+                f"mean_key_weight must be in [0, 1], got {self.mean_key_weight}"
+            )
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.mode != SparseKVMode.DISABLED.value
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceConfig:
     device: str | None = None
 
@@ -102,6 +168,7 @@ class KVCoreConfig:
     load_config: LoadConfig = field(default_factory=LoadConfig)
     cache_config: CacheConfig = field(default_factory=CacheConfig)
     scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
+    sparse_kv_config: SparseKVConfig = field(default_factory=SparseKVConfig)
     device_config: DeviceConfig = field(default_factory=DeviceConfig)
 
     def __post_init__(self) -> None:
@@ -132,4 +199,5 @@ __all__ = [
     "LoadConfig",
     "ModelConfig",
     "SchedulerConfig",
+    "SparseKVConfig",
 ]

@@ -7,6 +7,7 @@ import torch
 
 NULL_BLOCK_ID = 0
 PAD_SLOT_ID = -1
+PAD_BLOCK_INDEX = -1
 
 
 def cdiv(x: int, y: int) -> int:
@@ -88,7 +89,19 @@ class BlockTable:
             self.max_num_blocks_per_req,
             dtype=torch.int32,
         )
+        self.block_indices = self._make_buffer(
+            self.max_num_reqs,
+            self.max_num_blocks_per_req,
+            dtype=torch.int32,
+        )
+        self.block_indices.cpu.fill_(PAD_BLOCK_INDEX)
+        self.block_indices.gpu.fill_(PAD_BLOCK_INDEX)
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self.num_blocks_per_row_gpu = torch.zeros(
+            (max_num_reqs,),
+            dtype=torch.int32,
+            device=device,
+        )
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens,
             dtype=torch.int64,
@@ -100,17 +113,37 @@ class BlockTable:
             else None
         )
 
-    def append_row(self, block_ids: list[int], row_idx: int) -> None:
+    def append_row(
+        self,
+        block_ids: list[int],
+        row_idx: int,
+        block_indices: list[int] | None = None,
+    ) -> None:
         if not block_ids:
             return
         self._check_row_idx(row_idx)
+        if block_indices is None:
+            start_block_index = int(self.num_blocks_per_row[row_idx])
+            block_indices = list(
+                range(start_block_index, start_block_index + len(block_ids))
+            )
+        if len(block_indices) != len(block_ids):
+            raise ValueError(
+                "block_indices must have the same length as block_ids, "
+                f"got {len(block_indices)} and {len(block_ids)}"
+            )
         mapped_block_ids: Sequence[int] | np.ndarray = block_ids
+        mapped_block_indices: Sequence[int] | np.ndarray = block_indices
         if self.use_hybrid_blocks:
             assert self._kernel_block_arange is not None
             mapped_block_ids = self.map_to_kernel_blocks(
                 np.array(block_ids, dtype=np.int32),
                 self.blocks_per_kv_block,
                 self._kernel_block_arange,
+            )
+            mapped_block_indices = np.repeat(
+                np.array(block_indices, dtype=np.int32),
+                self.blocks_per_kv_block,
             )
 
         num_blocks = len(mapped_block_ids)
@@ -122,17 +155,24 @@ class BlockTable:
                 f"capacity is {self.max_num_blocks_per_req}"
             )
         self.block_table.np[row_idx, start:end] = mapped_block_ids
+        self.block_indices.np[row_idx, start:end] = mapped_block_indices
         self.num_blocks_per_row[row_idx] = end
 
-    def add_row(self, block_ids: list[int], row_idx: int) -> None:
+    def add_row(
+        self,
+        block_ids: list[int],
+        row_idx: int,
+        block_indices: list[int] | None = None,
+    ) -> None:
         self.clear_row(row_idx)
-        self.append_row(block_ids, row_idx)
+        self.append_row(block_ids, row_idx, block_indices)
 
     def clear_row(self, row_idx: int) -> None:
         self._check_row_idx(row_idx)
         num_blocks = int(self.num_blocks_per_row[row_idx])
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = NULL_BLOCK_ID
+            self.block_indices.np[row_idx, :num_blocks] = PAD_BLOCK_INDEX
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
@@ -140,8 +180,10 @@ class BlockTable:
         self._check_row_idx(tgt)
         num_blocks = int(self.num_blocks_per_row[src])
         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+        self.block_indices.np[tgt, :num_blocks] = self.block_indices.np[src, :num_blocks]
         if num_blocks < self.max_num_blocks_per_req:
             self.block_table.np[tgt, num_blocks:] = NULL_BLOCK_ID
+            self.block_indices.np[tgt, num_blocks:] = PAD_BLOCK_INDEX
         self.num_blocks_per_row[tgt] = num_blocks
 
     def swap_row(self, src: int, tgt: int) -> None:
@@ -149,6 +191,7 @@ class BlockTable:
         self._check_row_idx(tgt)
         self.num_blocks_per_row[[src, tgt]] = self.num_blocks_per_row[[tgt, src]]
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+        self.block_indices.np[[src, tgt]] = self.block_indices.np[[tgt, src]]
 
     def compute_slot_mapping(
         self,
@@ -186,11 +229,19 @@ class BlockTable:
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
+        self.block_indices.copy_to_gpu(num_reqs)
+        self.num_blocks_per_row_gpu[:num_reqs].copy_(
+            torch.from_numpy(self.num_blocks_per_row[:num_reqs]),
+            non_blocking=False,
+        )
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(NULL_BLOCK_ID)
         self.block_table.cpu.fill_(NULL_BLOCK_ID)
+        self.block_indices.gpu.fill_(PAD_BLOCK_INDEX)
+        self.block_indices.cpu.fill_(PAD_BLOCK_INDEX)
         self.num_blocks_per_row.fill(0)
+        self.num_blocks_per_row_gpu.fill_(0)
 
     @staticmethod
     def map_to_kernel_blocks(
@@ -208,6 +259,12 @@ class BlockTable:
 
     def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
         return self.block_table.gpu[:num_reqs]
+
+    def get_block_indices_device_tensor(self, num_reqs: int) -> torch.Tensor:
+        return self.block_indices.gpu[:num_reqs]
+
+    def get_num_blocks_device_tensor(self, num_reqs: int) -> torch.Tensor:
+        return self.num_blocks_per_row_gpu[:num_reqs]
 
     def get_cpu_tensor(self) -> torch.Tensor:
         return self.block_table.cpu
@@ -276,13 +333,25 @@ class MultiGroupBlockTable:
             )
         ]
 
-    def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+    def append_row(
+        self,
+        block_ids: tuple[list[int], ...],
+        row_idx: int,
+        block_indices: tuple[list[int], ...] | None = None,
+    ) -> None:
         for idx, block_table in enumerate(self.block_tables):
-            block_table.append_row(block_ids[idx], row_idx)
+            layer_block_indices = None if block_indices is None else block_indices[idx]
+            block_table.append_row(block_ids[idx], row_idx, layer_block_indices)
 
-    def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+    def add_row(
+        self,
+        block_ids: tuple[list[int], ...],
+        row_idx: int,
+        block_indices: tuple[list[int], ...] | None = None,
+    ) -> None:
         for idx, block_table in enumerate(self.block_tables):
-            block_table.add_row(block_ids[idx], row_idx)
+            layer_block_indices = None if block_indices is None else block_indices[idx]
+            block_table.add_row(block_ids[idx], row_idx, layer_block_indices)
 
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:
@@ -325,5 +394,6 @@ __all__ = [
     "CpuGpuBuffer",
     "MultiGroupBlockTable",
     "NULL_BLOCK_ID",
+    "PAD_BLOCK_INDEX",
     "PAD_SLOT_ID",
 ]
